@@ -15,7 +15,10 @@ from torch.utils.tensorboard import SummaryWriter
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+import isaaclab.utils.math as math_utils
 
 from .qmini_task_env_cfg import QminiTaskEnvCfg
 
@@ -24,6 +27,8 @@ class QminiTaskEnv(DirectRLEnv):
     cfg: QminiTaskEnvCfg
 
     def __init__(self, cfg: QminiTaskEnvCfg, render_mode: str | None = None, **kwargs):
+        self.visualization_markers: VisualizationMarkers | None = None
+        self.marker_offset: torch.Tensor | None = None
         super().__init__(cfg, render_mode, **kwargs)
 
         self._controlled_joint_names = list(self.cfg.controlled_joints)
@@ -50,11 +55,10 @@ class QminiTaskEnv(DirectRLEnv):
         self._action_scale = (self._joint_upper - self._joint_lower) * 0.5
 
         self._upright_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
-        self._failure_up_cos = math.cos(self.cfg.failure_tilt_angle)
-        self._success_up_cos = self.cfg.success_upright_cos
         self._min_height = self.cfg.failure_min_height
         self._success_joint_tol = self.cfg.success_joint_tol
         self._orientation_noise = math.radians(self.cfg.orientation_noise_deg)
+        self._failure_pitch_angle = float(self.cfg.failure_pitch_angle)
 
         self._action_filter_gain = float(self.cfg.action_filter_gain)
         self._prev_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
@@ -75,6 +79,10 @@ class QminiTaskEnv(DirectRLEnv):
         self._tb_writer = SummaryWriter(log_dir=str(log_dir))
         self._tb_step = 0
 
+        self.marker_offset = torch.tensor([0.0, 0.0, 0.5], device=device, dtype=self.robot.data.root_pos_w.dtype)
+        self._setup_visual_markers()
+        self._visualize_markers()
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -84,6 +92,25 @@ class QminiTaskEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self.robot
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.8, 0.8, 0.8))
         light_cfg.func("/World/Light", light_cfg)
+        self._setup_visual_markers()
+
+    def _setup_visual_markers(self) -> None:
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/qmini_arrows",
+            markers={
+                "forward": sim_utils.UsdFileCfg(
+                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                    scale=(0.125, 0.125, 0.25),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
+                ),
+                "command": sim_utils.UsdFileCfg(
+                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                    scale=(0.125, 0.125, 0.25),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                ),
+            },
+        )
+        self.visualization_markers = VisualizationMarkers(cfg=marker_cfg)
 
     @staticmethod
     def _quat_to_euler(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -160,6 +187,7 @@ class QminiTaskEnv(DirectRLEnv):
         self._command_timer[env_ids_t] = 0.0
         self._gait_phase[env_ids_t] = torch.rand(env_ids_t.numel(), device=self.device) * 2.0 * math.pi
         self._update_command_direction(env_ids_t)
+        self._visualize_markers()
 
     def _update_command_direction(self, env_ids: torch.Tensor | Sequence[int] | None = None) -> None:
         if env_ids is None:
@@ -221,6 +249,39 @@ class QminiTaskEnv(DirectRLEnv):
         upper = self._joint_upper.unsqueeze(0)
         return torch.clamp(targets, lower, upper)
 
+    def _visualize_markers(self) -> None:
+        if self.visualization_markers is None:
+            return
+
+        root_pos = self.robot.data.root_pos_w
+        root_quat = self.robot.data.root_quat_w
+        pos = root_pos + self.marker_offset
+
+        cmd_xy = self._command[:, :2]
+        cmd_speed = torch.norm(cmd_xy, dim=1)
+        cmd_yaw = torch.atan2(cmd_xy[:, 1], cmd_xy[:, 0])
+
+        zero_mask = cmd_speed < 1e-5
+        cmd_quat = math_utils.quat_from_euler_xyz(
+            torch.zeros_like(cmd_yaw),
+            torch.zeros_like(cmd_yaw),
+            cmd_yaw,
+        )
+        if zero_mask.any():
+            cmd_quat[zero_mask] = root_quat[zero_mask]
+
+        positions = torch.cat([pos, pos], dim=0)
+        rotations = torch.cat([root_quat, cmd_quat], dim=0)
+        marker_ids = torch.cat(
+            [
+                torch.zeros(self.scene.num_envs, dtype=torch.long, device=self.device),
+                torch.ones(self.scene.num_envs, dtype=torch.long, device=self.device),
+            ],
+            dim=0,
+        )
+
+        self.visualization_markers.visualize(positions, rotations, marker_indices=marker_ids)
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         raw_actions = torch.clamp(actions, -1.0, 1.0)
         gain = self._action_filter_gain
@@ -281,6 +342,7 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
             self._tb_writer.add_scalar("obs/pitch_deg", torch.rad2deg(pitch).mean().item(), self._tb_step)
 
+        self._visualize_markers()
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -367,9 +429,7 @@ class QminiTaskEnv(DirectRLEnv):
         too_low = base_height < self._min_height
 
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        tilt_exceeded = (torch.abs(pitch) > self.cfg.failure_tilt_angle) | (
-            torch.abs(roll) > self.cfg.failure_tilt_angle
-        )
+        tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
 
         out_of_limits = too_low | tilt_exceeded
         time_out = self.episode_length_buf >= self.max_episode_length - 1
