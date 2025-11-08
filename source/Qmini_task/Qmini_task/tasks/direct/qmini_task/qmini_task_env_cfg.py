@@ -123,7 +123,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     # - spaces definition
     action_space = 10
-    observation_space = 30
+    observation_space = 37
     state_space = 0
 
     # simulation
@@ -207,6 +207,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_base_ang_vel = 0.5
     rew_scale_action_rate = 0.05
     rew_scale_success = 2.0
+    rew_scale_cmd_lin_vel = 3.0
+    rew_scale_cmd_yaw_vel = 0.5
+    rew_scale_gait = 0.5
 
     # success / failure thresholds
     success_joint_tol = 0.05
@@ -219,6 +222,21 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # reset sampling
     reset_noise_scale = 0.1
     orientation_noise_deg = 15.0
+
+    # command profile
+    command_lin_vel_x_range = (-0.6, 0.8)
+    command_lin_vel_y_range = (-0.6, 0.6)
+    command_yaw_range = (-1.0, 1.0)
+    command_change_interval_s = 2.0
+
+    # gait parameters
+    gait_cycle_duration = 0.8
+    gait_hip_amp = 0.35
+    gait_knee_base = -0.6
+    gait_knee_amp = 0.35
+    gait_knee_phase = math.pi / 2
+    gait_ankle_base = 0.25
+    gait_ankle_amp = 0.15
 
     # action smoothing
     action_smoothing_rate = 0.1

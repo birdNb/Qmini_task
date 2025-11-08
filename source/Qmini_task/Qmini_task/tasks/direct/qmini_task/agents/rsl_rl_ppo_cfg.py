@@ -10,10 +10,10 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 32
-    max_iterations = 2000
+    num_steps_per_env = 48
+    max_iterations = 20000
     save_interval = 200
-    experiment_name = "qmini_stand"
+    experiment_name = "qmini_omni"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -27,7 +27,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=0.02,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,

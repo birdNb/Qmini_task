@@ -61,6 +61,15 @@ class QminiTaskEnv(DirectRLEnv):
         self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
 
+        self._command = torch.zeros((self.scene.num_envs, 3), device=device)
+        self._command_dir = torch.zeros((self.scene.num_envs, 2), device=device)
+        self._command_timer = torch.zeros(self.scene.num_envs, device=device)
+        self._command_change_interval = float(self.cfg.command_change_interval_s)
+
+        self._gait_phase = torch.zeros(self.scene.num_envs, device=device)
+        cycle = max(self.cfg.gait_cycle_duration, 1e-6)
+        self._gait_phase_rate = 2.0 * math.pi / cycle
+
         log_dir = Path("logs/qmini_stand")
         log_dir.mkdir(parents=True, exist_ok=True)
         self._tb_writer = SummaryWriter(log_dir=str(log_dir))
@@ -128,6 +137,90 @@ class QminiTaskEnv(DirectRLEnv):
         z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
         return torch.stack((w, x, y, z), dim=1)
 
+    def _sample_commands(self, env_ids: torch.Tensor | Sequence[int] | None) -> None:
+        if env_ids is None:
+            env_ids_t = torch.arange(self.scene.num_envs, device=self.device, dtype=torch.long)
+        elif isinstance(env_ids, torch.Tensor):
+            env_ids_t = env_ids.to(device=self.device, dtype=torch.long)
+        else:
+            env_ids_t = torch.as_tensor(list(env_ids), device=self.device, dtype=torch.long)
+
+        if env_ids_t.numel() == 0:
+            return
+
+        x_min, x_max = self.cfg.command_lin_vel_x_range
+        y_min, y_max = self.cfg.command_lin_vel_y_range
+        yaw_min, yaw_max = self.cfg.command_yaw_range
+
+        rand_vals = torch.rand((env_ids_t.numel(), 3), device=self.device)
+        self._command[env_ids_t, 0] = x_min + (x_max - x_min) * rand_vals[:, 0]
+        self._command[env_ids_t, 1] = y_min + (y_max - y_min) * rand_vals[:, 1]
+        self._command[env_ids_t, 2] = yaw_min + (yaw_max - yaw_min) * rand_vals[:, 2]
+
+        self._command_timer[env_ids_t] = 0.0
+        self._gait_phase[env_ids_t] = torch.rand(env_ids_t.numel(), device=self.device) * 2.0 * math.pi
+        self._update_command_direction(env_ids_t)
+
+    def _update_command_direction(self, env_ids: torch.Tensor | Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            cmd_xy = self._command[:, :2]
+            env_ids_t = slice(None)
+        else:
+            if isinstance(env_ids, torch.Tensor):
+                env_ids_t = env_ids.to(device=self.device, dtype=torch.long)
+            else:
+                env_ids_t = torch.as_tensor(list(env_ids), device=self.device, dtype=torch.long)
+            cmd_xy = self._command[env_ids_t, :2]
+
+        norm = torch.norm(cmd_xy, dim=1, keepdim=True)
+        dir_vec = torch.zeros_like(cmd_xy)
+        mask = norm.squeeze(1) > 1e-5
+        if mask.any():
+            dir_vec[mask] = cmd_xy[mask] / norm[mask]
+
+        if isinstance(env_ids_t, slice):
+            self._command_dir = dir_vec
+        else:
+            self._command_dir[env_ids_t] = dir_vec
+
+    def _compute_gait_targets(self) -> torch.Tensor:
+        num_envs = self.scene.num_envs
+        targets = self._target_pos.unsqueeze(0).expand(num_envs, -1).clone()
+
+        cmd_xy = self._command[:, :2]
+        cmd_speed = torch.norm(cmd_xy, dim=1)
+        max_speed = max(
+            1e-6,
+            abs(self.cfg.command_lin_vel_x_range[0]),
+            abs(self.cfg.command_lin_vel_x_range[1]),
+            abs(self.cfg.command_lin_vel_y_range[0]),
+            abs(self.cfg.command_lin_vel_y_range[1]),
+        )
+        speed_gain = torch.clamp(cmd_speed / max_speed, 0.0, 1.0)
+
+        phase_left = self._gait_phase
+        phase_right = (self._gait_phase + math.pi) % (2.0 * math.pi)
+
+        hip_amp = self.cfg.gait_hip_amp * speed_gain
+        knee_amp = self.cfg.gait_knee_amp * speed_gain
+        ankle_amp = self.cfg.gait_ankle_amp * speed_gain
+
+        targets[:, 0] = 0.25 * self._command[:, 1]
+        targets[:, 5] = -0.25 * self._command[:, 1]
+
+        targets[:, 2] = hip_amp * torch.sin(phase_left)
+        targets[:, 7] = hip_amp * torch.sin(phase_right)
+
+        targets[:, 3] = self.cfg.gait_knee_base + knee_amp * torch.sin(phase_left + self.cfg.gait_knee_phase)
+        targets[:, 8] = self.cfg.gait_knee_base + knee_amp * torch.sin(phase_right + self.cfg.gait_knee_phase)
+
+        targets[:, 4] = self.cfg.gait_ankle_base + ankle_amp * torch.sin(phase_left)
+        targets[:, 9] = self.cfg.gait_ankle_base + ankle_amp * torch.sin(phase_right)
+
+        lower = self._joint_lower.unsqueeze(0)
+        upper = self._joint_upper.unsqueeze(0)
+        return torch.clamp(targets, lower, upper)
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         raw_actions = torch.clamp(actions, -1.0, 1.0)
         gain = self._action_filter_gain
@@ -136,6 +229,14 @@ class QminiTaskEnv(DirectRLEnv):
             self.actions = self._filtered_actions
         else:
             self.actions = raw_actions
+
+        if self._command_change_interval > 0.0:
+            self._command_timer += self.step_dt
+            env_ids = torch.nonzero(self._command_timer >= self._command_change_interval, as_tuple=False).squeeze(-1)
+            if env_ids.numel() > 0:
+                self._sample_commands(env_ids)
+
+        self._gait_phase = (self._gait_phase + self._gait_phase_rate * self.step_dt) % (2.0 * math.pi)
 
     def _apply_action(self) -> None:
         targets = self._action_mid + self._action_scale * self.actions
@@ -161,7 +262,20 @@ class QminiTaskEnv(DirectRLEnv):
         base_lin_vel = root_state[:, 7:10]
         base_ang_vel = root_state[:, 10:13]
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        obs = torch.cat((current_pos, current_vel, base_quat, base_lin_vel, base_ang_vel), dim=1)
+        phase_features = torch.stack((torch.sin(self._gait_phase), torch.cos(self._gait_phase)), dim=1)
+        obs = torch.cat(
+            (
+                current_pos,
+                current_vel,
+                base_quat,
+                base_lin_vel,
+                base_ang_vel,
+                self._command,
+                self._command_dir,
+                phase_features,
+            ),
+            dim=1,
+        )
 
         if self._tb_step % 128 == 0:
             self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
@@ -190,6 +304,14 @@ class QminiTaskEnv(DirectRLEnv):
         ang_vel_norm = torch.norm(base_ang_vel, dim=1)
         action_rate = torch.norm(self.actions - self._prev_actions, dim=1)
 
+        cmd_error = base_lin_vel[:, :2] - self._command[:, :2]
+        rew_cmd_lin = -self.cfg.rew_scale_cmd_lin_vel * torch.norm(cmd_error, dim=1)
+        yaw_error = base_ang_vel[:, 2] - self._command[:, 2]
+        rew_cmd_yaw = -self.cfg.rew_scale_cmd_yaw_vel * torch.abs(yaw_error)
+        gait_targets = self._compute_gait_targets()
+        gait_error = torch.norm(current_pos - gait_targets, dim=1)
+        rew_gait = -self.cfg.rew_scale_gait * gait_error
+
         rew_alive = self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float())
         rew_term = self.cfg.rew_scale_terminated * self.reset_terminated.float()
         rew_joint = -self.cfg.rew_scale_joint * joint_error
@@ -215,6 +337,9 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_base_ang
             + rew_action
             + rew_success
+            + rew_cmd_lin
+            + rew_cmd_yaw
+            + rew_gait
         )
 
         if self._tb_step % 32 == 0:
@@ -224,8 +349,10 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("reward/upright_penalty", rew_upright.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/joint_penalty", rew_joint.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/action_rate_penalty", rew_action.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/cmd_lin", rew_cmd_lin.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/cmd_yaw", rew_cmd_yaw.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/gait", rew_gait.mean().item(), self._tb_step)
 
-        self._tb_step += 1
         self._prev_actions = self.actions.clone()
         self._tb_step += 1
         return total_reward
@@ -277,6 +404,8 @@ class QminiTaskEnv(DirectRLEnv):
             default_quat = default_root_state[:, 3:7]
             new_quat = self._quat_multiply(delta_quat, default_quat)
             default_root_state[:, 3:7] = new_quat
+
+        self._sample_commands(env_ids)
 
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel
