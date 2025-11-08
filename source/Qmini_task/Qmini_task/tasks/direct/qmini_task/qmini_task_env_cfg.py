@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
 import isaaclab.sim as sim_utils
 
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -17,13 +19,14 @@ QMINI_USD_PATH = "/home/bird/isaacSim/Learn/Qmini/Qmini_1108.usd"
 QMINI_ROBOT_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=QMINI_USD_PATH,
-        activate_contact_sensors=True,
+        activate_contact_sensors=False,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
             max_linear_velocity=5.0,
             max_angular_velocity=10.0,
             max_depenetration_velocity=1.0,
             enable_gyroscopic_forces=True,
+            disable_gravity=False,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
@@ -34,18 +37,18 @@ QMINI_ROBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.35),
+        pos=(0.0, 0.0, 0.45),
         joint_pos={
             "LL_joint1": 0.0,
             "LL_joint2": 0.0,
-            "LL_joint3": 0.5,
-            "LL_joint4": -1.0,
-            "LL_joint5": 0.8,
+            "LL_joint3": 0.0,
+            "LL_joint4": 0.0,
+            "LL_joint5": 0.0,
             "RL_joint1": 0.0,
             "RL_joint2": 0.0,
-            "RL_joint3": 0.5,
-            "RL_joint4": -1.0,
-            "RL_joint5": 0.8,
+            "RL_joint3": 0.0,
+            "RL_joint4": 0.0,
+            "RL_joint5": 0.0,
         },
     ),
     actuators={
@@ -120,7 +123,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     # - spaces definition
     action_space = 10
-    observation_space = 24
+    observation_space = 30
     state_space = 0
 
     # simulation
@@ -128,6 +131,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         dt=1 / 120,
         render_interval=decimation,
         physics_prim_path="/physicsScene",
+        gravity=(0.0, 0.0, -9.81),
     )
 
     # robot(s)
@@ -136,7 +140,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
         num_envs=256,
-        env_spacing=3.0,
+        env_spacing=1.0,
         replicate_physics=True,
     )
 
@@ -182,23 +186,38 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     target_joint_pos = {
         "LL_joint1": 0.0,
-        "LL_joint2": 0.15,
-        "LL_joint3": 0.7,
-        "LL_joint4": -1.0,
-        "LL_joint5": 0.9,
+        "LL_joint2": 0.0,
+        "LL_joint3": 0.0,
+        "LL_joint4": 0.0,
+        "LL_joint5": 0.0,
         "RL_joint1": 0.0,
-        "RL_joint2": -0.15,
-        "RL_joint3": 0.7,
-        "RL_joint4": -1.0,
-        "RL_joint5": 0.9,
+        "RL_joint2": 0.0,
+        "RL_joint3": 0.0,
+        "RL_joint4": 0.0,
+        "RL_joint5": 0.0,
     }
 
     # reward scales
     rew_scale_alive = 0.1
-    rew_scale_terminated = -0.5
-    rew_scale_position = 1.0
-    rew_scale_velocity = 0.05
-    rew_scale_action_rate = 0.01
+    rew_scale_terminated = -1.0
+    rew_scale_joint = 1.0
+    rew_scale_joint_vel = 0.5
+    rew_scale_upright = 5.0
+    rew_scale_base_lin_vel = 0.5
+    rew_scale_base_ang_vel = 0.5
+    rew_scale_action_rate = 0.05
+    rew_scale_success = 2.0
+
+    # success / failure thresholds
+    success_joint_tol = 0.05
+    success_upright_cos = 0.98
+    failure_tilt_angle = math.pi / 3  # 60 deg
+    failure_min_height = 0.12  # [m]
 
     # reset sampling
-    reset_noise_scale = 0.15
+    reset_noise_scale = 0.1
+
+    # action smoothing
+    action_smoothing_rate = 0.1
+    max_joint_velocity = 2.0  # [rad/s]
+    action_filter_gain = 0.2

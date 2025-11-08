@@ -10,16 +10,17 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
-    max_iterations = 2000
+    num_steps_per_env = 32
+    max_iterations = 15000
     save_interval = 200
-    experiment_name = "qmini_direct"
+    experiment_name = "qmini_stand"
+    empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.8,
+        init_noise_std=1.0,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[256, 256],
-        critic_hidden_dims=[256, 256],
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
@@ -27,7 +28,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         use_clipped_value_loss=True,
         clip_param=0.2,
         entropy_coef=0.01,
-        num_learning_epochs=4,
+        num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,
         schedule="adaptive",
