@@ -212,11 +212,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     success_joint_tol = 0.05
     success_upright_cos = 0.98
     success_pitch_tol = math.radians(5.0)
-    failure_tilt_angle = math.pi / 4  # 60 deg
+    # reset 阈值
+    failure_tilt_angle = math.radians(45.0)
     failure_min_height = 0.12  # [m]
 
     # reset sampling
     reset_noise_scale = 0.1
+    orientation_noise_deg = 15.0
 
     # action smoothing
     action_smoothing_rate = 0.1

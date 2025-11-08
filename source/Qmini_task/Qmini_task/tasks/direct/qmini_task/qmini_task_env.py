@@ -54,6 +54,7 @@ class QminiTaskEnv(DirectRLEnv):
         self._success_up_cos = self.cfg.success_upright_cos
         self._min_height = self.cfg.failure_min_height
         self._success_joint_tol = self.cfg.success_joint_tol
+        self._orientation_noise = math.radians(self.cfg.orientation_noise_deg)
 
         self._action_filter_gain = float(self.cfg.action_filter_gain)
         self._prev_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
@@ -94,6 +95,38 @@ class QminiTaskEnv(DirectRLEnv):
         cosy_cosp = 1 - 2 * (y * y + z * z)
         yaw = torch.atan2(siny_cosp, cosy_cosp)
         return roll, pitch, yaw
+
+    @staticmethod
+    def _euler_to_quat(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+        """Convert Euler angles to quaternion (w, x, y, z)."""
+        half_roll = roll * 0.5
+        half_pitch = pitch * 0.5
+        half_yaw = yaw * 0.5
+
+        cr = torch.cos(half_roll)
+        sr = torch.sin(half_roll)
+        cp = torch.cos(half_pitch)
+        sp = torch.sin(half_pitch)
+        cy = torch.cos(half_yaw)
+        sy = torch.sin(half_yaw)
+
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+        return torch.stack((w, x, y, z), dim=1)
+
+    @staticmethod
+    def _quat_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Multiply two quaternions (w, x, y, z)."""
+        w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+        w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        return torch.stack((w, x, y, z), dim=1)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         raw_actions = torch.clamp(actions, -1.0, 1.0)
@@ -234,6 +267,16 @@ class QminiTaskEnv(DirectRLEnv):
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         default_root_state[:, 7:] = 0.0
+
+        if self._orientation_noise > 0.0:
+            noise_roll = (torch.rand(len(env_ids), device=joint_pos.device) - 0.5) * 2.0 * self._orientation_noise
+            noise_pitch = (torch.rand(len(env_ids), device=joint_pos.device) - 0.5) * 2.0 * self._orientation_noise
+            noise_yaw = torch.zeros_like(noise_roll)
+
+            delta_quat = self._euler_to_quat(noise_roll, noise_pitch, noise_yaw)
+            default_quat = default_root_state[:, 3:7]
+            new_quat = self._quat_multiply(delta_quat, default_quat)
+            default_root_state[:, 3:7] = new_quat
 
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel
