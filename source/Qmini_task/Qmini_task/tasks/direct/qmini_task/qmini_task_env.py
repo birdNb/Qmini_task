@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 import math
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -57,6 +59,11 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
+
+        log_dir = Path("logs/qmini_stand")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self._tb_writer = SummaryWriter(log_dir=str(log_dir))
+        self._tb_step = 0
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -120,7 +127,13 @@ class QminiTaskEnv(DirectRLEnv):
         base_quat = root_state[:, 3:7]
         base_lin_vel = root_state[:, 7:10]
         base_ang_vel = root_state[:, 10:13]
+        roll, pitch, _ = self._quat_to_euler(base_quat)
         obs = torch.cat((current_pos, current_vel, base_quat, base_lin_vel, base_ang_vel), dim=1)
+
+        if self._tb_step % 128 == 0:
+            self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("obs/pitch_deg", torch.rad2deg(pitch).mean().item(), self._tb_step)
+
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
@@ -132,9 +145,10 @@ class QminiTaskEnv(DirectRLEnv):
         base_quat = root_state[:, 3:7]
         base_lin_vel = root_state[:, 7:10]
         base_ang_vel = root_state[:, 10:13]
-
-        base_up = self._quat_apply(base_quat, self._upright_axis.unsqueeze(0).expand(root_state.shape[0], -1))
-        upright_error = 1.0 - torch.clamp(base_up[:, 2], max=1.0)
+        roll, pitch, _ = self._quat_to_euler(base_quat)
+        orientation_error = torch.sqrt(roll * roll + pitch * pitch)
+        roll_deg = torch.rad2deg(roll)
+        pitch_deg = torch.rad2deg(pitch)
 
         pos_error = current_pos - target_pos
         joint_error = torch.norm(pos_error, dim=1)
@@ -147,14 +161,15 @@ class QminiTaskEnv(DirectRLEnv):
         rew_term = self.cfg.rew_scale_terminated * self.reset_terminated.float()
         rew_joint = -self.cfg.rew_scale_joint * joint_error
         rew_joint_vel = -self.cfg.rew_scale_joint_vel * joint_vel_norm
-        rew_upright = -self.cfg.rew_scale_upright * upright_error
+        rew_upright = -self.cfg.rew_scale_upright * orientation_error
         rew_base_lin = -self.cfg.rew_scale_base_lin_vel * lin_vel_norm
         rew_base_ang = -self.cfg.rew_scale_base_ang_vel * ang_vel_norm
         rew_action = -self.cfg.rew_scale_action_rate * action_rate
 
-        success_mask = (torch.max(torch.abs(pos_error), dim=1).values < self._success_joint_tol) & (
-            base_up[:, 2] > self._success_up_cos
+        orientation_ok = (torch.abs(roll) < self.cfg.success_pitch_tol) & (
+            torch.abs(pitch) < self.cfg.success_pitch_tol
         )
+        success_mask = (torch.max(torch.abs(pos_error), dim=1).values < self._success_joint_tol) & orientation_ok
         rew_success = self.cfg.rew_scale_success * success_mask.float()
 
         total_reward = (
@@ -169,7 +184,17 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_success
         )
 
+        if self._tb_step % 32 == 0:
+            self._tb_writer.add_scalar("pose/roll_deg", roll_deg.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("pose/pitch_deg", pitch_deg.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/total", total_reward.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/upright_penalty", rew_upright.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/joint_penalty", rew_joint.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/action_rate_penalty", rew_action.mean().item(), self._tb_step)
+
+        self._tb_step += 1
         self._prev_actions = self.actions.clone()
+        self._tb_step += 1
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -178,14 +203,13 @@ class QminiTaskEnv(DirectRLEnv):
 
         root_state = self.robot.data.root_state_w
         base_quat = root_state[:, 3:7]
-        base_pos_z = root_state[:, 2]
-        base_up = self._quat_apply(base_quat, self._upright_axis.unsqueeze(0).expand(root_state.shape[0], -1))
         base_height = root_state[:, 2]
         too_low = base_height < self._min_height
 
-
-        _, pitch, _ = self._quat_to_euler(base_quat)
-        tilt_exceeded = torch.abs(pitch) > self.cfg.failure_tilt_angle
+        roll, pitch, _ = self._quat_to_euler(base_quat)
+        tilt_exceeded = (torch.abs(pitch) > self.cfg.failure_tilt_angle) | (
+            torch.abs(roll) > self.cfg.failure_tilt_angle
+        )
 
         out_of_limits = too_low | tilt_exceeded
         time_out = self.episode_length_buf >= self.max_episode_length - 1

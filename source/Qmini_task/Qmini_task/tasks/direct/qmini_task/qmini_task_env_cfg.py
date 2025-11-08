@@ -211,7 +211,8 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # success / failure thresholds
     success_joint_tol = 0.05
     success_upright_cos = 0.98
-    failure_tilt_angle = math.pi / 3  # 60 deg
+    success_pitch_tol = math.radians(5.0)
+    failure_tilt_angle = math.pi / 4  # 60 deg
     failure_min_height = 0.12  # [m]
 
     # reset sampling
@@ -219,5 +220,5 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # action smoothing
     action_smoothing_rate = 0.1
-    max_joint_velocity = 2.0  # [rad/s]
+    max_joint_velocity = 5.0  # [rad/s]
     action_filter_gain = 0.2
