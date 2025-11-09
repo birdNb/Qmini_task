@@ -201,7 +201,8 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_alive = 0.1
     rew_scale_terminated = -1.0
     rew_scale_joint = 1.0
-    rew_scale_joint_vel = 0.5
+    rew_scale_joint_vel = 0.1       # 降低 joint_vel 惩罚的权重
+    rew_scale_joint_speed = 0.5     # 低速惩罚
     rew_scale_upright = 5.0
     rew_scale_base_lin_vel = 0.5
     rew_scale_base_ang_vel = 0.5
@@ -210,6 +211,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_cmd_lin_vel = 3.0
     rew_scale_cmd_yaw_vel = 0.5
     rew_scale_gait = 0.5
+    rew_scale_height = 0.3         # 身高奖励
+    rew_scale_single_leg = 5.0     # 单腿支撑高额奖励
+    rew_scale_tilt_fail = 10.0     # 倾角超限惩罚
 
     # success / failure thresholds
     success_joint_tol = 0.05
@@ -220,12 +224,14 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # reset sampling
     reset_noise_scale = 0.1
-    orientation_noise_deg = 15.0
+    orientation_noise_deg = 5.0     # 减小初始姿态噪声
+
+    joint_target_speed = 1.0        # 目标关节速度 [rad/s]
 
     # command profile
-    command_lin_vel_x_range = (-0.6, 0.8)
-    command_lin_vel_y_range = (-0.6, 0.6)
-    command_yaw_range = (-1.0, 1.0)
+    command_lin_vel_x_range = (0.0, 0.8)
+    command_lin_vel_y_range = (0.0, 0.0)
+    command_yaw_range = (0.0, 0.0)
     command_change_interval_s = 2.0
 
     # gait parameters
@@ -239,5 +245,5 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # action smoothing
     action_smoothing_rate = 0.1
-    max_joint_velocity = 5.0  # [rad/s]
+    max_joint_velocity = 8.0  # [rad/s]
     action_filter_gain = 0.2

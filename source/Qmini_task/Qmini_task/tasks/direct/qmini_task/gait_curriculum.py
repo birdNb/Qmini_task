@@ -24,12 +24,14 @@ class OmniGaitCurriculum:
             self.lin_vel_y_schedule.append(cfg.command_lin_vel_y_range)
         elif self.lin_vel_y_schedule[-1] != cfg.command_lin_vel_y_range:
             self.lin_vel_y_schedule.append(cfg.command_lin_vel_y_range)
+        self.lin_vel_y_schedule = [(0.0, 0.0) for _ in self.lin_vel_y_schedule]
 
         self.yaw_schedule = list(getattr(cfg, "curriculum_yaw_range_schedule", ()))
         if not self.yaw_schedule:
             self.yaw_schedule.append(cfg.command_yaw_range)
         elif self.yaw_schedule[-1] != cfg.command_yaw_range:
             self.yaw_schedule.append(cfg.command_yaw_range)
+        self.yaw_schedule = [(0.0, 0.0) for _ in self.yaw_schedule]
 
         self.phase_durations = list(getattr(cfg, "curriculum_phase_durations", ()))
         self.height_threshold = getattr(cfg, "curriculum_height_threshold", 0.3)

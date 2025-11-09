@@ -85,6 +85,8 @@ class QminiTaskEnv(DirectRLEnv):
         cycle = max(self.cfg.gait_cycle_duration, 1e-6)
         self._gait_phase_rate = 2.0 * math.pi / cycle
         self._control_dt = self.step_dt
+        self._joint_target_speed = getattr(self.cfg, "joint_target_speed", 1.0)
+        self._joint_speed_scale = getattr(self.cfg, "rew_scale_joint_speed", 0.0)
 
         log_dir = Path("logs/qmini_stand")
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +369,7 @@ class QminiTaskEnv(DirectRLEnv):
         orientation_error = torch.sqrt(roll * roll + pitch * pitch)
         roll_deg = torch.rad2deg(roll)
         pitch_deg = torch.rad2deg(pitch)
+        tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
 
         pos_error = current_pos - target_pos
         joint_error = torch.norm(pos_error, dim=1)
@@ -385,6 +388,9 @@ class QminiTaskEnv(DirectRLEnv):
         gait_stats = compute_gait_rewards(self, root_state)
         rew_height = gait_stats["reward_height"]
         rew_single = gait_stats["reward_single"]
+        joint_speed_deficit = torch.clamp(self._joint_target_speed - torch.abs(current_vel), min=0.0)
+        rew_joint_speed = -self._joint_speed_scale * torch.mean(joint_speed_deficit, dim=1)
+        rew_tilt_fail = -self.cfg.rew_scale_tilt_fail * tilt_exceeded.float()
 
         rew_alive = self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float())
         rew_term = self.cfg.rew_scale_terminated * self.reset_terminated.float()
@@ -416,6 +422,8 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_gait
             + rew_height
             + rew_single
+            + rew_tilt_fail
+            + rew_joint_speed
         )
 
         if self._tb_step % 32 == 0:
@@ -430,9 +438,13 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("reward/gait", rew_gait.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/height", rew_height.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/single_leg", rew_single.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/tilt_fail", rew_tilt_fail.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/joint_speed", rew_joint_speed.mean().item(), self._tb_step)
 
         cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
-        if self.curriculum.update(self._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean):
+        if self.curriculum.update(
+            self._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean
+        ):
             self._sample_commands(None)
 
         self._prev_actions = self.actions.clone()
@@ -449,9 +461,9 @@ class QminiTaskEnv(DirectRLEnv):
         too_low = base_height < self._min_height
 
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        # tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
+        tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
 
-        out_of_limits = too_low  # | tilt_exceeded
+        out_of_limits = too_low | tilt_exceeded
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return out_of_limits, time_out
 
