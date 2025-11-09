@@ -429,9 +429,9 @@ class QminiTaskEnv(DirectRLEnv):
         too_low = base_height < self._min_height
 
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
+        # tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
 
-        out_of_limits = too_low | tilt_exceeded
+        out_of_limits = too_low  # | tilt_exceeded
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return out_of_limits, time_out
 
