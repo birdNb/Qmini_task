@@ -20,6 +20,9 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 import isaaclab.utils.math as math_utils
 
+from .gait_curriculum import OmniGaitCurriculum
+from .gait_rewards import compute_gait_rewards
+
 from .qmini_task_env_cfg import QminiTaskEnvCfg
 
 
@@ -70,9 +73,18 @@ class QminiTaskEnv(DirectRLEnv):
         self._command_timer = torch.zeros(self.scene.num_envs, device=device)
         self._command_change_interval = float(self.cfg.command_change_interval_s)
 
+        left_bodies, _ = self.robot.find_bodies(["LL_ankle"])
+        right_bodies, _ = self.robot.find_bodies(["RL_ankle"])
+        if len(left_bodies) == 0 or len(right_bodies) == 0:
+            raise RuntimeError("Failed to locate ankle bodies for gait metrics.")
+        self._left_foot_body_idx = int(left_bodies[0])
+        self._right_foot_body_idx = int(right_bodies[0])
+        self._single_leg_margin = getattr(self.cfg, "single_leg_height_margin", 0.03)
+
         self._gait_phase = torch.zeros(self.scene.num_envs, device=device)
         cycle = max(self.cfg.gait_cycle_duration, 1e-6)
         self._gait_phase_rate = 2.0 * math.pi / cycle
+        self._control_dt = self.step_dt
 
         log_dir = Path("logs/qmini_stand")
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +95,8 @@ class QminiTaskEnv(DirectRLEnv):
         self._setup_visual_markers()
         self._visualize_markers()
 
+        self.curriculum = OmniGaitCurriculum(self.cfg, self.device)
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -92,7 +106,6 @@ class QminiTaskEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self.robot
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.8, 0.8, 0.8))
         light_cfg.func("/World/Light", light_cfg)
-        self._setup_visual_markers()
 
     def _setup_visual_markers(self) -> None:
         marker_cfg = VisualizationMarkersCfg(
@@ -175,9 +188,10 @@ class QminiTaskEnv(DirectRLEnv):
         if env_ids_t.numel() == 0:
             return
 
-        x_min, x_max = self.cfg.command_lin_vel_x_range
-        y_min, y_max = self.cfg.command_lin_vel_y_range
-        yaw_min, yaw_max = self.cfg.command_yaw_range
+        x_range, y_range, yaw_range = self.curriculum.get_command_ranges()
+        x_min, x_max = x_range
+        y_min, y_max = y_range
+        yaw_min, yaw_max = yaw_range
 
         rand_vals = torch.rand((env_ids_t.numel(), 3), device=self.device)
         self._command[env_ids_t, 0] = x_min + (x_max - x_min) * rand_vals[:, 0]
@@ -217,13 +231,8 @@ class QminiTaskEnv(DirectRLEnv):
 
         cmd_xy = self._command[:, :2]
         cmd_speed = torch.norm(cmd_xy, dim=1)
-        max_speed = max(
-            1e-6,
-            abs(self.cfg.command_lin_vel_x_range[0]),
-            abs(self.cfg.command_lin_vel_x_range[1]),
-            abs(self.cfg.command_lin_vel_y_range[0]),
-            abs(self.cfg.command_lin_vel_y_range[1]),
-        )
+        x_range, y_range, _ = self.curriculum.get_command_ranges()
+        max_speed = max(1e-6, abs(x_range[0]), abs(x_range[1]), abs(y_range[0]), abs(y_range[1]))
         speed_gain = torch.clamp(cmd_speed / max_speed, 0.0, 1.0)
 
         phase_left = self._gait_phase
@@ -373,6 +382,9 @@ class QminiTaskEnv(DirectRLEnv):
         gait_targets = self._compute_gait_targets()
         gait_error = torch.norm(current_pos - gait_targets, dim=1)
         rew_gait = -self.cfg.rew_scale_gait * gait_error
+        gait_stats = compute_gait_rewards(self, root_state)
+        rew_height = gait_stats["reward_height"]
+        rew_single = gait_stats["reward_single"]
 
         rew_alive = self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float())
         rew_term = self.cfg.rew_scale_terminated * self.reset_terminated.float()
@@ -402,6 +414,8 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_cmd_lin
             + rew_cmd_yaw
             + rew_gait
+            + rew_height
+            + rew_single
         )
 
         if self._tb_step % 32 == 0:
@@ -414,6 +428,12 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("reward/cmd_lin", rew_cmd_lin.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/cmd_yaw", rew_cmd_yaw.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/gait", rew_gait.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/height", rew_height.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/single_leg", rew_single.mean().item(), self._tb_step)
+
+        cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
+        if self.curriculum.update(self._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean):
+            self._sample_commands(None)
 
         self._prev_actions = self.actions.clone()
         self._tb_step += 1
@@ -439,6 +459,9 @@ class QminiTaskEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        if self.curriculum.enabled and len(env_ids) == self.scene.num_envs:
+            self.curriculum.reset()
 
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
