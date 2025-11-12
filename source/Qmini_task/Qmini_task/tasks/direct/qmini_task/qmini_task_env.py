@@ -87,6 +87,29 @@ class QminiTaskEnv(DirectRLEnv):
         self._control_dt = self.step_dt
         self._joint_target_speed = getattr(self.cfg, "joint_target_speed", 1.0)
         self._joint_speed_scale = getattr(self.cfg, "rew_scale_joint_speed", 0.0)
+        self._height_fail_scale = getattr(self.cfg, "rew_scale_height_fail", 0.0)
+        self._foot_contact_threshold = max(getattr(self.cfg, "foot_contact_force_threshold", 1.0), 1e-3)
+        self._desired_foot_clearance = getattr(self.cfg, "desired_foot_clearance", 0.05)
+        self._foot_contact_sensor = None
+        sensors = getattr(self.scene, "sensors", None)
+        if sensors is not None:
+            if isinstance(sensors, dict):
+                self._foot_contact_sensor = sensors.get("foot_contact_sensor")
+            else:
+                self._foot_contact_sensor = getattr(sensors, "foot_contact_sensor", None)
+        self._foot_contact_indices: list[int] | None = None
+        if self._foot_contact_sensor is not None and hasattr(self._foot_contact_sensor, "body_names"):
+            try:
+                body_names = list(self._foot_contact_sensor.body_names)
+                indices: list[int] = []
+                for target in ("LL_ankle", "RL_ankle"):
+                    match_idx = next((i for i, name in enumerate(body_names) if target in name), None)
+                    if match_idx is not None:
+                        indices.append(match_idx)
+                if len(indices) == 2:
+                    self._foot_contact_indices = indices
+            except Exception:
+                self._foot_contact_indices = None
 
         log_dir = Path("logs/qmini_stand")
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +388,7 @@ class QminiTaskEnv(DirectRLEnv):
         base_quat = root_state[:, 3:7]
         base_lin_vel = root_state[:, 7:10]
         base_ang_vel = root_state[:, 10:13]
+        base_height = root_state[:, 2]
         roll, pitch, _ = self._quat_to_euler(base_quat)
         orientation_error = torch.sqrt(roll * roll + pitch * pitch)
         roll_deg = torch.rad2deg(roll)
@@ -377,6 +401,52 @@ class QminiTaskEnv(DirectRLEnv):
         lin_vel_norm = torch.norm(base_lin_vel, dim=1)
         ang_vel_norm = torch.norm(base_ang_vel, dim=1)
         action_rate = torch.norm(self.actions - self._prev_actions, dim=1)
+        forward_speed = torch.clamp(base_lin_vel[:, 0], min=0.0)
+        cmd_lin_x = self._command[:, 0]
+        cmd_yaw = self._command[:, 2]
+        lin_vel_scale = torch.clamp(torch.abs(cmd_lin_x), min=0.3, max=2.0) + 0.2
+        yaw_norm = torch.clamp(torch.abs(cmd_yaw), min=0.3, max=1.5) + 0.2
+        forward_factor = torch.clamp(5.0 / lin_vel_scale, min=2.0, max=10.0)
+        yaw_factor = torch.clamp(2.0 / yaw_norm, min=2.0, max=6.0)
+        forward_track = torch.exp(-forward_factor * (cmd_lin_x - base_lin_vel[:, 0]) ** 2)
+        yaw_track = torch.exp(-yaw_factor * (cmd_yaw - base_ang_vel[:, 2]) ** 2)
+        orientation_norm_sq = roll * roll + pitch * pitch
+        height_term = torch.exp(-70.0 * (base_height - self.cfg.desired_root_height) ** 2)
+        balance_factor = torch.clamp(5.0 / lin_vel_scale, min=2.0, max=8.0)
+        balance = 0.5 * (height_term * torch.exp(-balance_factor * orientation_norm_sq) + 1.0)
+
+        foot_positions = self.robot.data.body_pos_w[
+            :, (self._left_foot_body_idx, self._right_foot_body_idx), :
+        ]
+        foot_velocities = self.robot.data.body_vel_w[
+            :, (self._left_foot_body_idx, self._right_foot_body_idx), :
+        ]
+        foot_heights = foot_positions[:, :, 2]
+        foot_speed_xy = torch.norm(foot_velocities[:, :, :2], dim=-1)
+        contact_mask: torch.Tensor
+        if (
+            self._foot_contact_sensor is not None
+            and hasattr(self._foot_contact_sensor, "data")
+            and getattr(self._foot_contact_sensor.data, "net_forces_w", None) is not None
+        ):
+            forces = self._foot_contact_sensor.data.net_forces_w
+            try:
+                if self._foot_contact_indices is not None:
+                    index_tensor = torch.as_tensor(
+                        self._foot_contact_indices, device=self.device, dtype=torch.long
+                    )
+                    forces = forces.index_select(1, index_tensor)
+                contact_force_mag = torch.norm(forces[..., :3], dim=-1)
+                contact_mask = contact_force_mag > self._foot_contact_threshold
+            except Exception:
+                contact_mask = foot_heights < 0.02
+        else:
+            contact_mask = foot_heights < 0.02
+        contact_mask = contact_mask.float()
+        swing_mask = 1.0 - contact_mask
+        foot_clearance = torch.clamp(foot_heights - self._desired_foot_clearance, min=0.0)
+        foot_clearance_bonus = (foot_clearance * swing_mask).sum(dim=1)
+        foot_slip = (foot_speed_xy * contact_mask).sum(dim=1)
 
         cmd_error = base_lin_vel[:, :2] - self._command[:, :2]
         rew_cmd_lin = -self.cfg.rew_scale_cmd_lin_vel * torch.norm(cmd_error, dim=1)
@@ -390,6 +460,16 @@ class QminiTaskEnv(DirectRLEnv):
         rew_single = gait_stats["reward_single"]
         joint_speed_deficit = torch.clamp(self._joint_target_speed - torch.abs(current_vel), min=0.0)
         rew_joint_speed = -self._joint_speed_scale * torch.mean(joint_speed_deficit, dim=1)
+        forward_speed_scale = getattr(self.cfg, "rew_scale_forward_speed", 0.0)
+        rew_forward_speed = forward_speed_scale * forward_speed
+        rew_forward_track = getattr(self.cfg, "rew_scale_forward_track", 0.0) * forward_track
+        rew_yaw_track = getattr(self.cfg, "rew_scale_yaw_track", 0.0) * yaw_track
+        rew_balance = getattr(self.cfg, "rew_scale_balance", 0.0) * balance
+        rew_lateral_penalty = -getattr(self.cfg, "rew_scale_lateral_penalty", 0.0) * torch.abs(base_lin_vel[:, 1])
+        rew_foot_clear = getattr(self.cfg, "rew_scale_foot_clear", 0.0) * foot_clearance_bonus
+        rew_foot_slip = -getattr(self.cfg, "rew_scale_foot_slip", 0.0) * foot_slip
+        height_fail = base_height < self._min_height
+        rew_height_fail = -self._height_fail_scale * height_fail.float()
         rew_tilt_fail = -self.cfg.rew_scale_tilt_fail * tilt_exceeded.float()
 
         rew_alive = self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float())
@@ -423,6 +503,14 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_height
             + rew_single
             + rew_tilt_fail
+            + rew_height_fail
+            + rew_forward_speed
+            + rew_forward_track
+            + rew_yaw_track
+            + rew_balance
+            + rew_lateral_penalty
+            + rew_foot_clear
+            + rew_foot_slip
             + rew_joint_speed
         )
 
@@ -439,6 +527,14 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("reward/height", rew_height.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/single_leg", rew_single.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/tilt_fail", rew_tilt_fail.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/height_fail", rew_height_fail.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/forward_speed", rew_forward_speed.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/forward_track", rew_forward_track.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/yaw_track", rew_yaw_track.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/balance", rew_balance.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/lateral_penalty", rew_lateral_penalty.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/foot_clear", rew_foot_clear.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/foot_slip", rew_foot_slip.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/joint_speed", rew_joint_speed.mean().item(), self._tb_step)
 
         cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
@@ -461,9 +557,7 @@ class QminiTaskEnv(DirectRLEnv):
         too_low = base_height < self._min_height
 
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        tilt_exceeded = torch.abs(pitch) > self._failure_pitch_angle
-
-        out_of_limits = too_low | tilt_exceeded
+        out_of_limits = too_low  # tilt-based reset disabled per user request
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return out_of_limits, time_out
 

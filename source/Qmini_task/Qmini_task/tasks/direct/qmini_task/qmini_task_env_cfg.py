@@ -13,13 +13,14 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.sensors import ContactSensorCfg
 
 QMINI_USD_PATH = "/home/bird/isaacSim/Learn/Qmini/Qmini_1108.usd"
 
 QMINI_ROBOT_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=QMINI_USD_PATH,
-        activate_contact_sensors=False,
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
             max_linear_velocity=5.0,
@@ -54,61 +55,61 @@ QMINI_ROBOT_CFG = ArticulationCfg(
     actuators={
         "LL_hip_yaw": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint1"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=40.0,
             damping=6.0,
         ),
         "LL_hip_roll": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint2"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=50.0,
             damping=6.0,
         ),
         "LL_hip_pitch": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint3"],
-            effort_limit_sim=55.0,
+            effort_limit_sim=24.0,
             stiffness=60.0,
             damping=8.0,
         ),
         "LL_knee": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint4"],
-            effort_limit_sim=55.0,
+            effort_limit_sim=24.0,
             stiffness=70.0,
             damping=10.0,
         ),
         "LL_ankle": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint5"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=35.0,
             damping=6.0,
         ),
         "RL_hip_yaw": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint1"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=40.0,
             damping=6.0,
         ),
         "RL_hip_roll": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint2"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=50.0,
             damping=6.0,
         ),
         "RL_hip_pitch": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint3"],
-            effort_limit_sim=55.0,
+            effort_limit_sim=24.0,
             stiffness=60.0,
             damping=8.0,
         ),
         "RL_knee": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint4"],
-            effort_limit_sim=55.0,
+            effort_limit_sim=24.0,
             stiffness=70.0,
             damping=10.0,
         ),
         "RL_ankle": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint5"],
-            effort_limit_sim=45.0,
+            effort_limit_sim=24.0,
             stiffness=35.0,
             damping=6.0,
         ),
@@ -201,7 +202,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_alive = 0.1
     rew_scale_terminated = -1.0
     rew_scale_joint = 1.0
-    rew_scale_joint_vel = 0.1       # 降低 joint_vel 惩罚的权重
+    rew_scale_joint_vel = 0.05      # 进一步降低 joint_vel 惩罚
     rew_scale_joint_speed = 0.5     # 低速惩罚
     rew_scale_upright = 5.0
     rew_scale_base_lin_vel = 0.5
@@ -211,20 +212,32 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_cmd_lin_vel = 3.0
     rew_scale_cmd_yaw_vel = 0.5
     rew_scale_gait = 0.5
-    rew_scale_height = 0.3         # 身高奖励
-    rew_scale_single_leg = 5.0     # 单腿支撑高额奖励
+    rew_scale_height = 3.0         # 身高奖励，高度越高奖励越大
+    rew_scale_single_leg = 8.0     # 单腿支撑接触高额奖励
     rew_scale_tilt_fail = 10.0     # 倾角超限惩罚
+    rew_scale_height_fail = 12.0   # 高度过低重置惩罚
+    rew_scale_forward_speed = 4.0  # X 方向速度奖励
+    rew_scale_forward_track = 2.3  # 指令前向速度跟踪奖励
+    rew_scale_yaw_track = 2.0      # 指令偏航速度跟踪奖励
+    rew_scale_balance = 1.5        # 平衡奖励
+    rew_scale_lateral_penalty = 0.7  # 侧向速度惩罚
+    rew_scale_foot_clear = 1.2     # 摆动腿抬脚奖励
+    rew_scale_foot_slip = 0.6      # 支撑腿滑移惩罚
 
     # success / failure thresholds
     success_joint_tol = 0.05
     success_upright_cos = 0.98
     success_pitch_tol = math.radians(5.0)
     failure_pitch_angle = math.radians(45.0)
-    failure_min_height = 0.12  # [m]
+    failure_min_height = 0.25  # [m] 低于该高度重置
 
     # reset sampling
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
+
+    desired_root_height = 0.4       # 目标机身高度 [m]
+    foot_contact_force_threshold = 5.0  # 足底接触判定阈值 [N]
+    desired_foot_clearance = 0.05   # 摆动腿目标离地高度 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
 
@@ -247,3 +260,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     action_smoothing_rate = 0.1
     max_joint_velocity = 8.0  # [rad/s]
     action_filter_gain = 0.2
+
+    # sensors
+    foot_contact_sensor: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Qmini/.*_ankle",
+        update_period=0.0,
+        history_length=2,
+        track_air_time=True,
+        force_threshold=5.0,
+        debug_vis=False,
+    )
