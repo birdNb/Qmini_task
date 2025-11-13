@@ -9,11 +9,11 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 
 @configclass
-class SkyentificPoclegsRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+class QminiRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 30000
     save_interval = 200
-    experiment_name = "skyentific_poclegs_rough"
+    experiment_name = "qmini_rough"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -38,11 +38,15 @@ class SkyentificPoclegsRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
-class SkyentificPoclegsFlatPPORunnerCfg(SkyentificPoclegsRoughPPORunnerCfg):
+class QminiFlatPPORunnerCfg(QminiRoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
         self.max_iterations = 15000
-        self.experiment_name = "skyentific_poclegs_flat"
+        self.experiment_name = "qmini_flat"
         self.policy.actor_hidden_dims = [128, 128, 128]
         self.policy.critic_hidden_dims = [128, 128, 128]
+
+
+# Backward compatibility alias
+PPORunnerCfg = QminiRoughPPORunnerCfg

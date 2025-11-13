@@ -16,8 +16,6 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 import isaaclab.utils.math as math_utils
 
 from .gait_curriculum import OmniGaitCurriculum
@@ -124,7 +122,11 @@ class QminiTaskEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Load environment from USD file instead of default ground plane
+        environment_usd_path = "/home/bird/isaacSim/Learn/default_environment.usd"
+        environment_cfg = sim_utils.UsdFileCfg(usd_path=environment_usd_path)
+        environment_cfg.func("/World/environment", environment_cfg)
+
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
@@ -133,16 +135,17 @@ class QminiTaskEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _setup_visual_markers(self) -> None:
+        arrow_usd_path = "/home/bird/isaacSim/Learn/arrow_x.usd"
         marker_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/qmini_arrows",
             markers={
                 "forward": sim_utils.UsdFileCfg(
-                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                    usd_path=arrow_usd_path,
                     scale=(0.125, 0.125, 0.25),
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
                 ),
                 "command": sim_utils.UsdFileCfg(
-                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/arrow_x.usd",
+                    usd_path=arrow_usd_path,
                     scale=(0.125, 0.125, 0.25),
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
                 ),
