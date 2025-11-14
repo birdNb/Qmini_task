@@ -66,6 +66,34 @@ class QminiTaskEnv(DirectRLEnv):
         self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
 
+        # Joint indices for grouped observations
+        # HR joints (hip_pos): joint1
+        self._hip_joint_indices = [self._controlled_joint_indices[0], self._controlled_joint_indices[5]]
+        # HAA+HFE+KFE joints (kfe_pos): joint2,3,4
+        self._kfe_joint_indices = [
+            self._controlled_joint_indices[1], self._controlled_joint_indices[2], self._controlled_joint_indices[3],
+            self._controlled_joint_indices[6], self._controlled_joint_indices[7], self._controlled_joint_indices[8]
+        ]
+        # FFE joints (ffe_pos): joint5
+        self._ffe_joint_indices = [self._controlled_joint_indices[4], self._controlled_joint_indices[9]]
+
+        # Target positions for relative joint positions
+        self._hip_target = torch.tensor(
+            [self.cfg.target_joint_pos["LL_joint1"], self.cfg.target_joint_pos["RL_joint1"]],
+            device=device
+        )
+        self._kfe_target = torch.tensor(
+            [
+                self.cfg.target_joint_pos["LL_joint2"], self.cfg.target_joint_pos["LL_joint3"], self.cfg.target_joint_pos["LL_joint4"],
+                self.cfg.target_joint_pos["RL_joint2"], self.cfg.target_joint_pos["RL_joint3"], self.cfg.target_joint_pos["RL_joint4"]
+            ],
+            device=device
+        )
+        self._ffe_target = torch.tensor(
+            [self.cfg.target_joint_pos["LL_joint5"], self.cfg.target_joint_pos["RL_joint5"]],
+            device=device
+        )
+
         self._command = torch.zeros((self.scene.num_envs, 3), device=device)
         self._command_dir = torch.zeros((self.scene.num_envs, 2), device=device)
         self._command_timer = torch.zeros(self.scene.num_envs, device=device)
@@ -122,10 +150,7 @@ class QminiTaskEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
-        # Load environment from USD file instead of default ground plane
-        environment_usd_path = "/home/bird/isaacSim/Learn/default_environment.usd"
-        environment_cfg = sim_utils.UsdFileCfg(usd_path=environment_usd_path)
-        environment_cfg.func("/World/environment", environment_cfg)
+        # Terrain is configured in __post_init__ of config class
 
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
@@ -353,28 +378,91 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_targets = targets
 
     def _get_observations(self) -> dict:
-        current_pos = self.joint_pos[:, self._controlled_joint_indices]
-        current_vel = self.joint_vel[:, self._controlled_joint_indices]
+        """Get 42-dimensional observations following the reference implementation.
+
+        Observation breakdown:
+        1. base_lin_vel (3): Base linear velocity [vx, vy, vz]
+        2. base_ang_vel (3): Base angular velocity [ωx, ωy, ωz]
+        3. projected_gravity (3): Gravity projected in base frame
+        4. velocity_commands (3): Velocity commands [target_vx, target_vy, target_ωz]
+        5. hip_pos (2): HR joint positions relative to target (joint1)
+        6. kfe_pos (6): HAA+HFE+KFE joint positions relative to target (joint2,3,4)
+        7. ffe_pos (2): FFE joint positions relative to target (joint5)
+        8. joint_vel (10): All joint velocities relative to target
+        9. actions (10): Previous action
+        Total: 42 dimensions
+        """
         root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]
-        base_lin_vel = root_state[:, 7:10]
-        base_ang_vel = root_state[:, 10:13]
-        roll, pitch, _ = self._quat_to_euler(base_quat)
-        phase_features = torch.stack((torch.sin(self._gait_phase), torch.cos(self._gait_phase)), dim=1)
+        base_quat = root_state[:, 3:7]  # [w, x, y, z]
+        base_lin_vel = root_state[:, 7:10]  # [vx, vy, vz]
+        base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
+
+        # 1. base_lin_vel (3 dims) - with noise ±0.1
+        base_lin_vel_noise = torch.rand_like(base_lin_vel) * 0.2 - 0.1
+        obs_base_lin_vel = base_lin_vel + base_lin_vel_noise
+
+        # 2. base_ang_vel (3 dims) - with noise ±0.2
+        base_ang_vel_noise = torch.rand_like(base_ang_vel) * 0.4 - 0.2
+        obs_base_ang_vel = base_ang_vel + base_ang_vel_noise
+
+        # 3. projected_gravity (3 dims) - gravity vector in base frame
+        # Gravity in world frame: [0, 0, -1] (normalized)
+        gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
+        # Rotate gravity to base frame using quaternion
+        projected_gravity = math_utils.quat_rotate_inverse(base_quat, gravity_world)
+        projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05
+        obs_projected_gravity = projected_gravity + projected_gravity_noise
+
+        # 4. velocity_commands (3 dims) - [target_vx, target_vy, target_ωz]
+        # Convert command from [vx, vy, yaw] to [vx, vy, ωz]
+        velocity_commands = torch.zeros((self.scene.num_envs, 3), device=self.device)
+        velocity_commands[:, 0] = self._command[:, 0]  # vx
+        velocity_commands[:, 1] = self._command[:, 1]  # vy
+        velocity_commands[:, 2] = self._command[:, 2]  # yaw (used as ωz)
+
+        # 5. hip_pos (2 dims) - HR joints relative to target, noise ±0.03
+        hip_pos = self.joint_pos[:, self._hip_joint_indices]
+        hip_pos_rel = hip_pos - self._hip_target.unsqueeze(0)
+        hip_pos_noise = torch.rand_like(hip_pos_rel) * 0.06 - 0.03
+        obs_hip_pos = hip_pos_rel + hip_pos_noise
+
+        # 6. kfe_pos (6 dims) - HAA+HFE+KFE joints relative to target, noise ±0.05
+        kfe_pos = self.joint_pos[:, self._kfe_joint_indices]
+        kfe_pos_rel = kfe_pos - self._kfe_target.unsqueeze(0)
+        kfe_pos_noise = torch.rand_like(kfe_pos_rel) * 0.1 - 0.05
+        obs_kfe_pos = kfe_pos_rel + kfe_pos_noise
+
+        # 7. ffe_pos (2 dims) - FFE joints relative to target, noise ±0.08
+        ffe_pos = self.joint_pos[:, self._ffe_joint_indices]
+        ffe_pos_rel = ffe_pos - self._ffe_target.unsqueeze(0)
+        ffe_pos_noise = torch.rand_like(ffe_pos_rel) * 0.16 - 0.08
+        obs_ffe_pos = ffe_pos_rel + ffe_pos_noise
+
+        # 8. joint_vel (10 dims) - All joint velocities, noise ±1.5
+        joint_vel = self.joint_vel[:, self._controlled_joint_indices]
+        joint_vel_noise = torch.rand_like(joint_vel) * 3.0 - 1.5
+        obs_joint_vel = joint_vel + joint_vel_noise
+
+        # 9. actions (10 dims) - Previous action (no noise)
+        obs_actions = self._prev_actions
+        
+        # Concatenate all observations: 3+3+3+3+2+6+2+10+10 = 42 dims
         obs = torch.cat(
             (
-                current_pos,
-                current_vel,
-                base_quat,
-                base_lin_vel,
-                base_ang_vel,
-                self._command,
-                self._command_dir,
-                phase_features,
+                obs_base_lin_vel,      # 3
+                obs_base_ang_vel,       # 3
+                obs_projected_gravity,  # 3
+                velocity_commands,      # 3
+                obs_hip_pos,            # 2
+                obs_kfe_pos,            # 6
+                obs_ffe_pos,            # 2
+                obs_joint_vel,          # 10
+                obs_actions,            # 10
             ),
             dim=1,
         )
 
+        roll, pitch, _ = self._quat_to_euler(base_quat)
         if self._tb_step % 128 == 0:
             self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
             self._tb_writer.add_scalar("obs/pitch_deg", torch.rad2deg(pitch).mean().item(), self._tb_step)

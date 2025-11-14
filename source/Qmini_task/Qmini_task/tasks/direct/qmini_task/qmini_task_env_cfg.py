@@ -14,6 +14,10 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.sensors import ContactSensorCfg
+import isaaclab.terrains as terrain_gen
+from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
 
 QMINI_USD_PATH = "/home/bird/isaacSim/Learn/Qmini/Qmini_1108.usd"
 
@@ -117,6 +121,51 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 )
 
 
+ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(
+            proportion=0.3,
+        ),
+        "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.1, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+        "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.1, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+        "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+            proportion=0.05,
+            step_height_range=(0.0, 0.1),
+            step_width=0.3,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.05,
+            step_height_range=(0.0, 0.1),
+            step_width=0.3,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "wave_terrain": terrain_gen.HfWaveTerrainCfg(
+            proportion=0.2, amplitude_range=(0.0, 0.2), num_waves=4, border_width=0.25
+        ),
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.2, noise_range=(0.0, 0.06), noise_step=0.02, border_width=0.25
+        ),
+    },
+)
+
+
 @configclass
 class QminiTaskEnvCfg(DirectRLEnvCfg):
     # env
@@ -124,7 +173,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     # - spaces definition
     action_space = 10
-    observation_space = 37
+    observation_space = 42  # Updated to 42 dimensions
     state_space = 0
 
     # simulation
@@ -137,6 +186,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # robot(s)
     robot_cfg: ArticulationCfg = QMINI_ROBOT_CFG.replace(prim_path="/World/envs/env_.*/Qmini")
+
+    # terrain
+    terrain_cfg: TerrainGeneratorCfg = ROUGH_TERRAINS_CFG
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
@@ -270,3 +322,27 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         force_threshold=5.0,
         debug_vis=False,
     )
+
+    def __post_init__(self):
+        """Post initialization to set up terrain."""
+        super().__post_init__()
+        # Set up terrain in scene
+        self.scene.terrain = TerrainImporterCfg(
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=ROUGH_TERRAINS_CFG,
+            max_init_terrain_level=0,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            visual_material=sim_utils.MdlFileCfg(
+                mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+                project_uvw=True,
+                texture_scale=(0.25, 0.25),
+            ),
+            debug_vis=False,
+        )
