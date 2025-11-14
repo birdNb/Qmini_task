@@ -156,7 +156,7 @@ class QminiTaskEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self.robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.8, 0.8, 0.8))
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.6, 0.6, 0.6))
         light_cfg.func("/World/Light", light_cfg)
 
     def _setup_visual_markers(self) -> None:
@@ -409,7 +409,7 @@ class QminiTaskEnv(DirectRLEnv):
         # Gravity in world frame: [0, 0, -1] (normalized)
         gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
         # Rotate gravity to base frame using quaternion
-        projected_gravity = math_utils.quat_rotate_inverse(base_quat, gravity_world)
+        projected_gravity = math_utils.quat_apply_inverse(base_quat, gravity_world)
         projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05
         obs_projected_gravity = projected_gravity + projected_gravity_noise
 
