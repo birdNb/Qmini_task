@@ -59,61 +59,61 @@ QMINI_ROBOT_CFG = ArticulationCfg(
     actuators={
         "LL_hip_yaw": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint1"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=40.0,
             damping=6.0,
         ),
         "LL_hip_roll": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint2"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=60.0,
             stiffness=50.0,
             damping=6.0,
         ),
         "LL_hip_pitch": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint3"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=60.0,
             damping=8.0,
         ),
         "LL_knee": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint4"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=70.0,
             damping=10.0,
         ),
         "LL_ankle": ImplicitActuatorCfg(
             joint_names_expr=["LL_joint5"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=35.0,
             damping=6.0,
         ),
         "RL_hip_yaw": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint1"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=40.0,
             damping=6.0,
         ),
         "RL_hip_roll": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint2"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=60.0,
             stiffness=50.0,
             damping=6.0,
         ),
         "RL_hip_pitch": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint3"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=60.0,
             damping=8.0,
         ),
         "RL_knee": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint4"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=70.0,
             damping=10.0,
         ),
         "RL_ankle": ImplicitActuatorCfg(
             joint_names_expr=["RL_joint5"],
-            effort_limit_sim=24.0,
+            effort_limit_sim=20.0,
             stiffness=35.0,
             damping=6.0,
         ),
@@ -289,6 +289,19 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     desired_foot_clearance = 0.05   # 摆动腿目标离地高度 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
+    # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
+    joint_velocity_limits = (
+        1.0,   # LL_joint1
+        0.3,   # LL_joint2
+        1.0,   # LL_joint3
+        1.0,   # LL_joint4
+        1.0,   # LL_joint5
+        1.0,   # RL_joint1
+        0.3,   # RL_joint2
+        1.0,   # RL_joint3
+        1.0,   # RL_joint4
+        1.0,   # RL_joint5
+    )
 
     # command profile
     command_lin_vel_x_range = (0.0, 0.8)

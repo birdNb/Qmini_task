@@ -44,127 +44,156 @@ def compute_gait_rewards(env, root_state: torch.Tensor) -> Dict[str, torch.Tenso
 
 
 def compute_feet_air_time(env, threshold_min: float = 0.2, threshold_max: float = 0.5) -> torch.Tensor:
-    """Compute reward for feet air time (gait formation).
+    """Compute reward for feet air time (using left/right ankle contact sensors when available)."""
+    device = env.device
+    num_envs = env.scene.num_envs
+    sensors_dict = getattr(env.scene, "sensors", {})
+    left = sensors_dict.get("contact_forces_left", None)
+    right = sensors_dict.get("contact_forces_right", None)
+    combined = sensors_dict.get("contact_forces", None)
 
-    Following the reference implementation from isaaclab.envs.mdp.rewards.
+    rewards = torch.zeros(num_envs, device=device)
+    sensor_list = []
+    if left is not None:
+        sensor_list.append(left)
+    if right is not None:
+        sensor_list.append(right)
+    if not sensor_list and combined is not None:
+        sensor_list.append(combined)
+    if not sensor_list:
+        return rewards
 
-    Args:
-        env: The environment instance
-        threshold_min: Minimum air time to get reward (seconds)
-        threshold_max: Maximum air time to get reward (seconds)
+    for s in sensor_list:
+        if not hasattr(s, "data"):
+            continue
+        # first_contact mask
+        try:
+            first_contact = s.compute_first_contact(env.step_dt)
+        except Exception:
+            # fallback: use force threshold at current step
+            forces = getattr(s.data, "net_forces_w", None)
+            if forces is None:
+                continue
+            first_contact = (torch.norm(forces, dim=-1) > max(getattr(env, "_foot_contact_threshold", 5.0), 1e-3)).float()
+        # last_air_time
+        lat = getattr(s.data, "last_air_time", None)
+        if lat is None:
+            continue
+        # Sensors may report shape [N, 1] or [N, B]; reduce along bodies
+        while lat.dim() < 2:
+            lat = lat.unsqueeze(1)
+        while first_contact.dim() < 2:
+            first_contact = first_contact.unsqueeze(1)
+        air_time = (lat - threshold_min) * first_contact
+        air_time = torch.clamp(air_time, max=threshold_max - threshold_min)
+        rewards = rewards + air_time.sum(dim=1)
 
-    Returns:
-        Reward tensor of shape (num_envs,)
-    """
-    # Get contact sensor (configured to select ankles via prim path)
-    contact_sensor = None
-    if hasattr(env, "scene") and hasattr(env.scene, "sensors"):
-        sensors = env.scene.sensors
-        if isinstance(sensors, dict):
-            contact_sensor = sensors.get("contact_forces") or sensors.get("foot_contact_sensor")
-        else:
-            contact_sensor = getattr(sensors, "contact_forces", None) or getattr(sensors, "foot_contact_sensor", None)
-    if contact_sensor is None:
-        contact_sensor = getattr(env, "_foot_contact_sensor", None)
-    if contact_sensor is None or not hasattr(contact_sensor, "data"):
-        return torch.zeros(env.scene.num_envs, device=env.device)
-
-    # Use all bodies from the sensor (these are ankles per config)
-    try:
-        num_bodies = contact_sensor.data.last_air_time.shape[1]
-    except Exception:
-        num_bodies = contact_sensor.data.net_forces_w.shape[1]
-    body_ids = torch.arange(num_bodies, device=env.device, dtype=torch.long)
-
-    if body_ids is None or len(body_ids) == 0:
-        return torch.zeros(env.scene.num_envs, device=env.device)
-
-    # Compute first contact using the sensor's method
-    try:
-        first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, body_ids]
-    except Exception:
-        # Fallback: use contact forces to determine first contact
-        forces = contact_sensor.data.net_forces_w[:, body_ids, :]
-        contact_threshold = getattr(env, "_foot_contact_threshold", 5.0)
-        first_contact = (torch.norm(forces, dim=-1) > contact_threshold).float()
-
-    # Get last air time from sensor data
-    try:
-        last_air_time = contact_sensor.data.last_air_time[:, body_ids]
-    except Exception:
-        # If last_air_time doesn't exist, return zero
-        return torch.zeros(env.scene.num_envs, device=env.device)
-
-    # Negative reward for small steps (air time < threshold_min)
-    air_time = (last_air_time - threshold_min) * first_contact
-
-    # No reward for large steps (clamp to threshold_max - threshold_min)
-    air_time = torch.clamp(air_time, max=threshold_max - threshold_min)
-
-    # Sum over feet
-    reward = torch.sum(air_time, dim=1)
-
-    # No reward for zero command (only reward when moving)
+    # gate by commanded motion (optional)
     command = getattr(env, "_command", None)
     if command is not None:
         cmd_vel_xy = torch.norm(command[:, :2], dim=1)
-        reward = reward * (cmd_vel_xy > 0.1).float()
-
-    return reward
+        rewards = rewards * (cmd_vel_xy > 0.1).float()
+    return rewards
 
 
 def compute_feet_slide(env) -> torch.Tensor:
-    """Compute penalty for feet sliding during contact.
+    """Compute penalty for feet sliding during contact using left/right sensors when available."""
+    device = env.device
+    num_envs = env.scene.num_envs
+    sensors = getattr(env.scene, "sensors", {})
+    left = sensors.get("contact_forces_left", None)
+    right = sensors.get("contact_forces_right", None)
+    combined = sensors.get("contact_forces", None)
 
-    Following the reference implementation from isaaclab.envs.mdp.rewards.
+    total_penalty = torch.zeros(num_envs, device=device)
+    used = False
+    for s in [left, right] if (left or right) else [combined]:
+        if s is None or not hasattr(s, "data"):
+            continue
+        used = True
+        # contact mask
+        try:
+            hist = s.data.net_forces_w_history  # [N, H, B, 3]
+            contacts = hist.norm(dim=-1).max(dim=1)[0] > 1.0
+        except Exception:
+            forces = s.data.net_forces_w
+            if forces is None:
+                continue
+            contacts = torch.norm(forces, dim=-1) > 1.0
+        # velocities
+        robot = env.robot
+        try:
+            sensor_body_ids = s.body_ids
+            vel = robot.data.body_lin_vel_w[:, sensor_body_ids, :2]
+        except Exception:
+            # fallback: take the first B bodies
+            b = contacts.shape[1]
+            vel = robot.data.body_lin_vel_w[:, :b, :2]
+        total_penalty = total_penalty + torch.sum(vel.norm(dim=-1) * contacts.float(), dim=1)
+    if not used:
+        return torch.zeros(num_envs, device=device)
+    return total_penalty
 
-    Args:
-        env: The environment instance
 
-    Returns:
-        Penalty tensor of shape (num_envs,)
+def compute_leg_lift(env, clearance: float = 0.05) -> torch.Tensor:
+    """Reward lifting swing legs above a clearance height when not in contact.
+
+    Uses left/right ankle sensors (preferred) or combined sensor as fallback.
     """
-    # Get contact sensor (configured to ankles)
-    contact_sensor = None
-    if hasattr(env, "scene") and hasattr(env.scene, "sensors"):
-        sensors = env.scene.sensors
-        if isinstance(sensors, dict):
-            contact_sensor = sensors.get("contact_forces") or sensors.get("foot_contact_sensor")
+    device = env.device
+    num_envs = env.scene.num_envs
+    sensors = getattr(env.scene, "sensors", {})
+    left = sensors.get("contact_forces_left", None)
+    right = sensors.get("contact_forces_right", None)
+    combined = sensors.get("contact_forces", None)
+
+    # Determine ankle body indices on robot
+    ankle_names = ["LL_ankle", "RL_ankle"]
+    ankle_indices: list[int] = []
+    for name in ankle_names:
+        ids, _ = env.robot.find_bodies([name])
+        ankle_indices.append(int(ids[0]) if len(ids) > 0 else -1)
+
+    body_pos_w = env.robot.data.body_pos_w  # [N, bodies, 3]
+    reward = torch.zeros(num_envs, device=env.device)
+
+    def sensor_to_contact_mask(sensor) -> torch.Tensor | None:
+        if sensor is None or not hasattr(sensor, "data"):
+            return None
+        try:
+            hist = sensor.data.net_forces_w_history
+            return (hist.norm(dim=-1).max(dim=1)[0] > 1.0).float()  # [N, B]
+        except Exception:
+            forces = sensor.data.net_forces_w
+            if forces is None:
+                return None
+            return (torch.norm(forces, dim=-1) > 1.0).float()
+
+    # Build per-ankle swing mask
+    swing_masks: list[torch.Tensor] = []
+    # left
+    left_mask = sensor_to_contact_mask(left)
+    right_mask = sensor_to_contact_mask(right)
+    if left_mask is None and right_mask is None and combined is not None:
+        cmask = sensor_to_contact_mask(combined)
+        if cmask is not None:
+            # if combined has two ankles, split them; else treat as one
+            if cmask.shape[1] >= 2:
+                left_mask, right_mask = cmask[:, 0:1], cmask[:, 1:2]
+            else:
+                left_mask, right_mask = cmask, cmask
+
+    # For each ankle, reward positive height above clearance when not in contact
+    for idx, m in zip(ankle_indices, [left_mask, right_mask]):
+        if idx < 0:
+            continue
+        z = body_pos_w[:, idx, 2]
+        if m is None:
+            # no contact info: reward height directly
+            swing = torch.ones(num_envs, device=device)
         else:
-            contact_sensor = getattr(sensors, "contact_forces", None) or getattr(sensors, "foot_contact_sensor", None)
-    if contact_sensor is None:
-        contact_sensor = getattr(env, "_foot_contact_sensor", None)
-    if contact_sensor is None or not hasattr(contact_sensor, "data"):
-        return torch.zeros(env.scene.num_envs, device=env.device)
-
-    # Use all sensor bodies (ankles)
-    num_bodies = contact_sensor.data.net_forces_w.shape[1]
-    body_ids = torch.arange(num_bodies, device=env.device, dtype=torch.long)
-
-    if body_ids is None or len(body_ids) == 0:
-        return torch.zeros(env.scene.num_envs, device=env.device)
-
-    # Get contact mask from force history (following reference implementation)
-    try:
-        # Use history to get max force over recent steps
-        forces_history = contact_sensor.data.net_forces_w_history  # [num_envs, history, bodies, 3]
-        contacts = forces_history[:, :, body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
-    except Exception:
-        # Fallback: use current forces
-        forces = contact_sensor.data.net_forces_w[:, body_ids, :]
-        contacts = torch.norm(forces, dim=-1) > 1.0
-
-    # Get foot body velocities (horizontal only)
-    # Map from sensor's body_ids (ankles) to robot body indices if available,
-    # otherwise assume the first num_bodies correspond to ankles in robot order.
-    robot = env.robot
-    try:
-        sensor_body_ids = contact_sensor.body_ids  # indices into robot bodies
-        body_vel = robot.data.body_lin_vel_w[:, sensor_body_ids, :2]
-    except Exception:
-        body_vel = robot.data.body_lin_vel_w[:, :num_bodies, :2]  # fallback
-
-    # Penalty = horizontal velocity * contact_mask (only penalize when in contact)
-    penalty = torch.sum(body_vel.norm(dim=-1) * contacts.float(), dim=1)
-
-    return penalty
+            # when not in contact (mask==0) we consider swing
+            swing = 1.0 - torch.clamp(m.squeeze(-1), 0.0, 1.0)
+        lift = torch.clamp(z - clearance, min=0.0)
+        reward = reward + lift * swing
+    return reward

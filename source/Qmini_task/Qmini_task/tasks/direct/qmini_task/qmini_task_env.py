@@ -20,7 +20,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.utils.math as math_utils
 
 from .gait_curriculum import OmniGaitCurriculum
-from .gait_rewards import compute_gait_rewards, compute_feet_air_time, compute_feet_slide
+from .gait_rewards import compute_gait_rewards, compute_feet_air_time, compute_feet_slide, compute_leg_lift
 
 from .qmini_task_env_cfg import QminiTaskEnvCfg
 
@@ -373,10 +373,22 @@ class QminiTaskEnv(DirectRLEnv):
         if smoothing > 0.0:
             targets = self._prev_targets + smoothing * (targets - self._prev_targets)
 
-        max_delta = self.cfg.max_joint_velocity * self.step_dt
-        if max_delta > 0.0:
+        # Respect per-joint velocity limits if provided; else fall back to scalar
+        vel_lim = getattr(self.cfg, "joint_velocity_limits", None)
+        if vel_lim is not None:
+            # build [num_dofs] tensor
+            if isinstance(vel_lim, (list, tuple)):
+                vel_lim_t = torch.tensor(vel_lim, device=self.device, dtype=targets.dtype)
+            else:
+                vel_lim_t = torch.full((self._num_dofs,), float(vel_lim), device=self.device, dtype=targets.dtype)
+            max_delta = vel_lim_t * self.step_dt
             delta = torch.clamp(targets - self._prev_targets, min=-max_delta, max=max_delta)
             targets = self._prev_targets + delta
+        else:
+            max_delta = self.cfg.max_joint_velocity * self.step_dt
+            if max_delta > 0.0:
+                delta = torch.clamp(targets - self._prev_targets, min=-max_delta, max=max_delta)
+                targets = self._prev_targets + delta
 
         targets = torch.minimum(torch.maximum(targets, self._joint_lower), self._joint_upper)
 
@@ -518,6 +530,10 @@ class QminiTaskEnv(DirectRLEnv):
         # feet_slide: weight=-0.25
         rew_feet_slide = self.cfg.rew_scale_feet_slide * compute_feet_slide(self)
 
+        # leg_lift: encourage swing foot clearance when not in contact
+        leg_lift_raw = compute_leg_lift(self, clearance=self.cfg.desired_foot_clearance)
+        rew_leg_lift = getattr(self.cfg, "rew_scale_leg_lift", 1.0) * leg_lift_raw
+
         # ========== 3. Stability Penalties ==========
         # lin_vel_z_l2: weight=-2.0 (惩罚垂直速度)
         rew_lin_vel_z = self.cfg.rew_scale_lin_vel_z * (base_lin_vel[:, 2] ** 2)
@@ -602,6 +618,7 @@ class QminiTaskEnv(DirectRLEnv):
             + rew_undesired_contacts
             + rew_joint_deviation_hip
             + rew_joint_deviation_knee
+            + rew_leg_lift
         )
 
         # ========== Logging ==========
@@ -630,6 +647,8 @@ class QminiTaskEnv(DirectRLEnv):
             self._tb_writer.add_scalar("reward/track_ang_vel_z", rew_track_ang_vel_z.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/feet_air_time", rew_feet_air_time.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/feet_slide", rew_feet_slide.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/leg_lift_raw", leg_lift_raw.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("reward/leg_lift", rew_leg_lift.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/lin_vel_z", rew_lin_vel_z.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/ang_vel_xy", rew_ang_vel_xy.mean().item(), self._tb_step)
             self._tb_writer.add_scalar("reward/flat_orientation", rew_flat_orientation.mean().item(), self._tb_step)
