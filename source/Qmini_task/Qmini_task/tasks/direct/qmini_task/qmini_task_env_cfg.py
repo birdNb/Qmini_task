@@ -17,7 +17,7 @@ from isaaclab.sensors import ContactSensorCfg
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR
+# from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR  # unused
 
 QMINI_USD_PATH = "/home/bird/isaacSim/Learn/Qmini/Qmini_1108.usd"
 
@@ -250,31 +250,28 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "RL_joint5": 0.0,
     }
 
-    # reward scales
-    rew_scale_alive = 0.1
-    rew_scale_terminated = -1.0
-    rew_scale_joint = 1.0
-    rew_scale_joint_vel = 0.05      # 进一步降低 joint_vel 惩罚
-    rew_scale_joint_speed = 0.5     # 低速惩罚
-    rew_scale_upright = 5.0
-    rew_scale_base_lin_vel = 0.5
-    rew_scale_base_ang_vel = 0.5
-    rew_scale_action_rate = 0.05
-    rew_scale_success = 2.0
-    rew_scale_cmd_lin_vel = 3.0
-    rew_scale_cmd_yaw_vel = 0.5
-    rew_scale_gait = 0.5
-    rew_scale_height = 3.0         # 身高奖励，高度越高奖励越大
-    rew_scale_single_leg = 8.0     # 单腿支撑接触高额奖励
-    rew_scale_tilt_fail = 10.0     # 倾角超限惩罚
-    rew_scale_height_fail = 12.0   # 高度过低重置惩罚
-    rew_scale_forward_speed = 4.0  # X 方向速度奖励
-    rew_scale_forward_track = 2.3  # 指令前向速度跟踪奖励
-    rew_scale_yaw_track = 2.0      # 指令偏航速度跟踪奖励
-    rew_scale_balance = 1.5        # 平衡奖励
-    rew_scale_lateral_penalty = 0.7  # 侧向速度惩罚
-    rew_scale_foot_clear = 1.2     # 摆动腿抬脚奖励
-    rew_scale_foot_slip = 0.6      # 支撑腿滑移惩罚
+    # reward scales - Gait Training Rewards (following reference implementation)
+    # 1. Task Rewards
+    rew_scale_track_lin_vel_xy = 1.0      # track_lin_vel_xy_exp: weight=1.0
+    rew_scale_track_ang_vel_z = 0.5      # track_ang_vel_z_exp: weight=0.5
+
+    # 2. Gait Rewards
+    rew_scale_feet_air_time = 2.0        # feet_air_time: weight=2.0 (核心步态奖励)
+    rew_scale_feet_slide = -0.25         # feet_slide: weight=-0.25 (惩罚滑动)
+
+    # 3. Stability Penalties
+    rew_scale_lin_vel_z = -2.0          # lin_vel_z_l2: weight=-2.0 (惩罚垂直速度)
+    rew_scale_ang_vel_xy = -0.05        # ang_vel_xy_l2: weight=-0.05 (惩罚俯仰/滚转)
+    rew_scale_flat_orientation = -0.5    # flat_orientation_l2: weight=-0.5 (惩罚倾斜)
+
+    # 4. Action Penalties
+    rew_scale_joint_torques = -1.0e-5    # joint_torques_l2: weight=-1e-5 (惩罚力矩)
+    rew_scale_action_rate = -0.01       # action_rate_l2: weight=-0.01 (惩罚动作变化)
+
+    # 5. Contact Penalties
+    rew_scale_undesired_contacts = -1.0  # undesired_contacts: weight=-1.0 (惩罚不当接触)
+    rew_scale_joint_deviation_hip = -0.1  # joint_deviation_hip: weight=-0.1 (惩罚髋关节偏离)
+    rew_scale_joint_deviation_knee = -0.01  # joint_deviation_knee: weight=-0.01 (惩罚膝关节偏离)
 
     # success / failure thresholds
     success_joint_tol = 0.05
@@ -313,14 +310,20 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     max_joint_velocity = 8.0  # [rad/s]
     action_filter_gain = 0.2
 
-    # sensors
-    foot_contact_sensor: ContactSensorCfg = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/Qmini/.*_ankle",
+    # sensors - register separate contact sensors for both ankles
+    contact_forces_left: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Qmini/Qmini/LL_ankle",
         update_period=0.0,
-        history_length=2,
+        history_length=3,
         track_air_time=True,
-        force_threshold=5.0,
-        debug_vis=False,
+        debug_vis=True,
+    )
+    contact_forces_right: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Qmini/Qmini/RL_ankle",
+        update_period=0.0,
+        history_length=3,
+        track_air_time=True,
+        debug_vis=True,
     )
 
     def __post_init__(self):
@@ -336,13 +339,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
                 restitution_combine_mode="multiply",
-                static_friction=1.0,
-                dynamic_friction=1.0,
+                static_friction=2.0,  # 增大摩擦力
+                dynamic_friction=2.0,  # 增大摩擦力
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.2, 0.4, 0.2),  # Gray color for terrain
                 roughness=0.8,
                 metallic=0.0,
             ),
-            debug_vis=False,
+            debug_vis=False,  # 显示地形坐标系（关闭）
         )
