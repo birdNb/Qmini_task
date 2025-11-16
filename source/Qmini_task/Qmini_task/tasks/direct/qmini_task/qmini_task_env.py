@@ -20,7 +20,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.utils.math as math_utils
 
 from .gait_curriculum import OmniGaitCurriculum
-from .gait_rewards import compute_gait_rewards, compute_feet_air_time, compute_feet_slide, compute_leg_lift
+from .reward import compute_gait_rewards, compute_feet_air_time, compute_feet_slide, compute_leg_lift
 
 from .qmini_task_env_cfg import QminiTaskEnvCfg
 
@@ -148,6 +148,9 @@ class QminiTaskEnv(DirectRLEnv):
         self._visualize_markers()
 
         self.curriculum = OmniGaitCurriculum(self.cfg, self.device)
+        # forward distance accumulators (initialized on first reset)
+        self._prev_root_x = None
+        self._cum_forward_x = None
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -463,7 +466,7 @@ class QminiTaskEnv(DirectRLEnv):
 
         # 9. actions (10 dims) - Previous action (no noise)
         obs_actions = self._prev_actions
-        
+
         # Concatenate all observations: 3+3+3+3+2+6+2+10+10 = 42 dims
         obs = torch.cat(
             (
@@ -480,200 +483,13 @@ class QminiTaskEnv(DirectRLEnv):
             dim=1,
         )
 
-        roll, pitch, _ = self._quat_to_euler(base_quat)
-        if self._tb_step % 128 == 0:
-            self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("obs/pitch_deg", torch.rad2deg(pitch).mean().item(), self._tb_step)
-
         self._visualize_markers()
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards following the reference gait training implementation.
-
-        Reward breakdown:
-        1. Task rewards: track_lin_vel_xy_exp, track_ang_vel_z_exp
-        2. Gait rewards: feet_air_time, feet_slide
-        3. Stability penalties: lin_vel_z_l2, ang_vel_xy_l2, flat_orientation_l2
-        4. Action penalties: joint_torques_l2, action_rate_l2
-        5. Contact penalties: undesired_contacts, joint_deviation_hip, joint_deviation_knee
-        """
-        root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]
-        base_lin_vel = root_state[:, 7:10]
-        base_ang_vel = root_state[:, 10:13]
-        roll, pitch, _ = self._quat_to_euler(base_quat)
-        roll_deg = torch.rad2deg(roll)
-        pitch_deg = torch.rad2deg(pitch)
-
-        current_pos = self.joint_pos[:, self._controlled_joint_indices]
-        action_rate = torch.norm(self.actions - self._prev_actions, dim=1)
-
-        # ========== 1. Task Rewards (指数奖励) ==========
-        # track_lin_vel_xy_exp: weight=1.0, std=sqrt(0.25)=0.5
-        cmd_vel_xy = self._command[:, :2]
-        vel_error_xy = base_lin_vel[:, :2] - cmd_vel_xy
-        vel_error_xy_norm_sq = torch.sum(vel_error_xy ** 2, dim=1)
-        rew_track_lin_vel_xy = self.cfg.rew_scale_track_lin_vel_xy * torch.exp(-vel_error_xy_norm_sq / 0.25)
-
-        # track_ang_vel_z_exp: weight=0.5, std=sqrt(0.25)=0.5
-        cmd_ang_vel_z = self._command[:, 2]
-        ang_vel_error_z = base_ang_vel[:, 2] - cmd_ang_vel_z
-        rew_track_ang_vel_z = self.cfg.rew_scale_track_ang_vel_z * torch.exp(-ang_vel_error_z ** 2 / 0.25)
-
-        # ========== 2. Gait Rewards ==========
-        # feet_air_time: weight=2.0
-        rew_feet_air_time = self.cfg.rew_scale_feet_air_time * compute_feet_air_time(
-            self, threshold_min=0.2, threshold_max=0.5
-        )
-
-        # feet_slide: weight=-0.25
-        rew_feet_slide = self.cfg.rew_scale_feet_slide * compute_feet_slide(self)
-
-        # leg_lift: encourage swing foot clearance when not in contact
-        leg_lift_raw = compute_leg_lift(self, clearance=self.cfg.desired_foot_clearance)
-        rew_leg_lift = getattr(self.cfg, "rew_scale_leg_lift", 1.0) * leg_lift_raw
-
-        # ========== 3. Stability Penalties ==========
-        # lin_vel_z_l2: weight=-2.0 (惩罚垂直速度)
-        rew_lin_vel_z = self.cfg.rew_scale_lin_vel_z * (base_lin_vel[:, 2] ** 2)
-
-        # ang_vel_xy_l2: weight=-0.05 (惩罚俯仰/滚转)
-        rew_ang_vel_xy = self.cfg.rew_scale_ang_vel_xy * torch.sum(base_ang_vel[:, :2] ** 2, dim=1)
-
-        # flat_orientation_l2: weight=-0.5 (惩罚倾斜)
-        # Projected gravity should be [0, 0, -1] when upright
-        gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
-        projected_gravity = math_utils.quat_apply_inverse(base_quat, gravity_world)
-        # Deviation from [0, 0, -1] in base frame
-        gravity_error = projected_gravity - gravity_world
-        rew_flat_orientation = self.cfg.rew_scale_flat_orientation * torch.sum(gravity_error ** 2, dim=1)
-
-        # ========== 4. Action Penalties ==========
-        # joint_torques_l2: weight=-1e-5
-        joint_torques = self.robot.data.applied_torque[:, self._controlled_joint_indices]
-        rew_joint_torques = self.cfg.rew_scale_joint_torques * torch.sum(joint_torques ** 2, dim=1)
-
-        # action_rate_l2: weight=-0.01
-        rew_action_rate = self.cfg.rew_scale_action_rate * action_rate
-
-        # ========== 5. Contact Penalties ==========
-        # undesired_contacts: weight=-1.0 (惩罚髋关节接触)
-        rew_undesired_contacts = torch.zeros(self.scene.num_envs, device=self.device)
-        if self._foot_contact_sensor is not None and hasattr(self._foot_contact_sensor, "data"):
-            forces = self._foot_contact_sensor.data.net_forces_w
-            # Find hip body indices (HFE, HAA)
-            hip_body_names = ["LL_HFE", "RL_HFE", "LL_HAA", "RL_HAA"]
-            hip_body_indices = []
-            for name in hip_body_names:
-                bodies, _ = self.robot.find_bodies([name])
-                if len(bodies) > 0:
-                    hip_body_indices.append(int(bodies[0]))
-            if hip_body_indices and hasattr(self._foot_contact_sensor, "body_ids"):
-                sensor_body_ids = self._foot_contact_sensor.body_ids
-                hip_sensor_indices = [i for i, body_id in enumerate(sensor_body_ids) if body_id in hip_body_indices]
-                if hip_sensor_indices:
-                    hip_forces = forces[:, hip_sensor_indices, :]
-                    contact_threshold = 1.0
-                    hip_contacts = torch.norm(hip_forces, dim=-1) > contact_threshold
-                    rew_undesired_contacts = self.cfg.rew_scale_undesired_contacts * torch.sum(hip_contacts.float(), dim=1)
-
-        # joint_deviation_hip: weight=-0.1 (HR, HAA关节偏离，相对目标位置)
-        # Use hip joint indices from observation setup
-        hip_pos = current_pos[:, [self._controlled_joint_indices.index(i) for i in self._hip_joint_indices]]
-        hip_target = self._hip_target.unsqueeze(0).expand_as(hip_pos)
-        hip_deviation = torch.abs(hip_pos - hip_target)
-        rew_joint_deviation_hip = self.cfg.rew_scale_joint_deviation_hip * torch.sum(hip_deviation, dim=1)
-
-        # joint_deviation_knee: weight=-0.01 (KFE关节偏离，相对目标位置)
-        # KFE joints are part of kfe_joint_indices, but we need only KFE (joint4)
-        kfe_joint_names = ["LL_joint4", "RL_joint4"]
-        kfe_only_indices = []
-        for name in kfe_joint_names:
-            joint_ids, _ = self.robot.find_joints([name])
-            if len(joint_ids) > 0 and joint_ids[0] in self._controlled_joint_indices:
-                kfe_only_indices.append(self._controlled_joint_indices.index(joint_ids[0]))
-        if kfe_only_indices:
-            knee_pos = current_pos[:, kfe_only_indices]
-            knee_target = torch.tensor(
-                [self.cfg.target_joint_pos[name] for name in kfe_joint_names],
-                device=self.device
-            ).unsqueeze(0).expand_as(knee_pos)
-            knee_deviation = torch.abs(knee_pos - knee_target)
-            rew_joint_deviation_knee = self.cfg.rew_scale_joint_deviation_knee * torch.sum(knee_deviation, dim=1)
-        else:
-            rew_joint_deviation_knee = torch.zeros(self.scene.num_envs, device=self.device)
-
-        # ========== Total Reward ==========
-        total_reward = (
-            rew_track_lin_vel_xy
-            + rew_track_ang_vel_z
-            + rew_feet_air_time
-            + rew_feet_slide
-            + rew_lin_vel_z
-            + rew_ang_vel_xy
-            + rew_flat_orientation
-            + rew_joint_torques
-            + rew_action_rate
-            + rew_undesired_contacts
-            + rew_joint_deviation_hip
-            + rew_joint_deviation_knee
-            + rew_leg_lift
-        )
-
-        # ========== Logging ==========
-        if self._tb_step % 32 == 0:
-            # Contact forces (left/right ankles) - log mean of per-env max-norm
-            left_force_mean = None
-            right_force_mean = None
-            try:
-                sensors = getattr(self.scene, "sensors", {})
-                left_sensor = sensors.get("contact_forces_left") if isinstance(sensors, dict) else None
-                right_sensor = sensors.get("contact_forces_right") if isinstance(sensors, dict) else None
-                if left_sensor is not None and hasattr(left_sensor, "data") and left_sensor.data.net_forces_w is not None:
-                    lf = left_sensor.data.net_forces_w  # [N, bodies(=1), 3] typically
-                    left_force_mean = torch.norm(lf, dim=-1).amax(dim=1).mean().item()
-                if right_sensor is not None and hasattr(right_sensor, "data") and right_sensor.data.net_forces_w is not None:
-                    rf = right_sensor.data.net_forces_w
-                    right_force_mean = torch.norm(rf, dim=-1).amax(dim=1).mean().item()
-            except Exception:
-                left_force_mean = None
-                right_force_mean = None
-
-            self._tb_writer.add_scalar("pose/roll_deg", roll_deg.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("pose/pitch_deg", pitch_deg.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/total", total_reward.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/track_lin_vel_xy", rew_track_lin_vel_xy.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/track_ang_vel_z", rew_track_ang_vel_z.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/feet_air_time", rew_feet_air_time.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/feet_slide", rew_feet_slide.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/leg_lift_raw", leg_lift_raw.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/leg_lift", rew_leg_lift.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/lin_vel_z", rew_lin_vel_z.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/ang_vel_xy", rew_ang_vel_xy.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/flat_orientation", rew_flat_orientation.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/joint_torques", rew_joint_torques.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/action_rate", rew_action_rate.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/undesired_contacts", rew_undesired_contacts.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/joint_deviation_hip", rew_joint_deviation_hip.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/joint_deviation_knee", rew_joint_deviation_knee.mean().item(), self._tb_step)
-            if left_force_mean is not None:
-                self._tb_writer.add_scalar("contact/left_force_max_mean", left_force_mean, self._tb_step)
-            if right_force_mean is not None:
-                self._tb_writer.add_scalar("contact/right_force_max_mean", right_force_mean, self._tb_step)
-
-        # ========== Curriculum Update ==========
-        cmd_error = base_lin_vel[:, :2] - self._command[:, :2]
-        cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
-        gait_stats = compute_gait_rewards(self, root_state)
-        if self.curriculum.update(
-            self._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean
-        ):
-            self._sample_commands(None)
-
-        self._prev_actions = self.actions.clone()
-        self._tb_step += 1
-        return total_reward
+        """Delegates reward computation to reward.py for better modularity."""
+        from .reward import compute_total_reward
+        return compute_total_reward(self)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.joint_pos = self.robot.data.joint_pos
@@ -726,6 +542,13 @@ class QminiTaskEnv(DirectRLEnv):
 
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel
+
+        # initialize forward accumulators if needed, and reset for these envs
+        if self._prev_root_x is None or self._cum_forward_x is None:
+            self._prev_root_x = torch.zeros(self.scene.num_envs, device=self.device)
+            self._cum_forward_x = torch.zeros(self.scene.num_envs, device=self.device)
+        self._prev_root_x[env_ids] = default_root_state[:, 0]
+        self._cum_forward_x[env_ids] = 0.0
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)

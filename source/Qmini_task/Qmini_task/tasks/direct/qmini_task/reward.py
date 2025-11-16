@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
+import isaaclab.utils.math as math_utils
 
 
 def compute_gait_rewards(env, root_state: torch.Tensor) -> Dict[str, torch.Tensor | float]:
@@ -170,8 +171,6 @@ def compute_leg_lift(env, clearance: float = 0.05) -> torch.Tensor:
             return (torch.norm(forces, dim=-1) > 1.0).float()
 
     # Build per-ankle swing mask
-    swing_masks: list[torch.Tensor] = []
-    # left
     left_mask = sensor_to_contact_mask(left)
     right_mask = sensor_to_contact_mask(right)
     if left_mask is None and right_mask is None and combined is not None:
@@ -189,11 +188,143 @@ def compute_leg_lift(env, clearance: float = 0.05) -> torch.Tensor:
             continue
         z = body_pos_w[:, idx, 2]
         if m is None:
-            # no contact info: reward height directly
             swing = torch.ones(num_envs, device=device)
         else:
-            # when not in contact (mask==0) we consider swing
             swing = 1.0 - torch.clamp(m.squeeze(-1), 0.0, 1.0)
         lift = torch.clamp(z - clearance, min=0.0)
         reward = reward + lift * swing
     return reward
+
+
+def compute_total_reward(env) -> torch.Tensor:
+    """Full reward computation moved from env._get_rewards."""
+    # root/base states
+    root_state = env.robot.data.root_state_w
+    base_quat = root_state[:, 3:7]
+    base_lin_vel = root_state[:, 7:10]
+    base_ang_vel = root_state[:, 10:13]
+
+    current_pos = env.joint_pos[:, env._controlled_joint_indices]
+    action_rate = torch.norm(env.actions - env._prev_actions, dim=1)
+
+    # 1) Task rewards
+    cmd_vel_xy = env._command[:, :2]
+    vel_error_xy = base_lin_vel[:, :2] - cmd_vel_xy
+    vel_error_xy_norm_sq = torch.sum(vel_error_xy ** 2, dim=1)
+    rew_track_lin_vel_xy = env.cfg.rew_scale_track_lin_vel_xy * torch.exp(-vel_error_xy_norm_sq / 0.25)
+
+    cmd_ang_vel_z = env._command[:, 2]
+    ang_vel_error_z = base_ang_vel[:, 2] - cmd_ang_vel_z
+    rew_track_ang_vel_z = env.cfg.rew_scale_track_ang_vel_z * torch.exp(-ang_vel_error_z ** 2 / 0.25)
+
+    # 2) Gait rewards
+    rew_feet_air_time = env.cfg.rew_scale_feet_air_time * compute_feet_air_time(
+        env, threshold_min=0.05, threshold_max=0.5
+    )
+    rew_feet_slide = env.cfg.rew_scale_feet_slide * compute_feet_slide(env)
+
+    leg_lift_raw = compute_leg_lift(env, clearance=env.cfg.desired_foot_clearance)
+    rew_leg_lift = getattr(env.cfg, "rew_scale_leg_lift", 1.0) * leg_lift_raw
+
+    # 3) Stability penalties
+    rew_lin_vel_z = env.cfg.rew_scale_lin_vel_z * (base_lin_vel[:, 2] ** 2)
+    rew_ang_vel_xy = env.cfg.rew_scale_ang_vel_xy * torch.sum(base_ang_vel[:, :2] ** 2, dim=1)
+
+    gravity_world = torch.tensor([0.0, 0.0, -1.0], device=env.device).unsqueeze(0).expand(env.scene.num_envs, -1)
+    projected_gravity = math_utils.quat_apply_inverse(base_quat, gravity_world)
+    gravity_error = projected_gravity - gravity_world
+    rew_flat_orientation = env.cfg.rew_scale_flat_orientation * torch.sum(gravity_error ** 2, dim=1)
+
+    # 4) Action penalties
+    joint_torques = env.robot.data.applied_torque[:, env._controlled_joint_indices]
+    rew_joint_torques = env.cfg.rew_scale_joint_torques * torch.sum(joint_torques ** 2, dim=1)
+    rew_action_rate = env.cfg.rew_scale_action_rate * action_rate
+
+    # 5) Contact penalties
+    rew_undesired_contacts = torch.zeros(env.scene.num_envs, device=env.device)
+    if getattr(env, "_foot_contact_sensor", None) is not None and hasattr(env._foot_contact_sensor, "data"):
+        forces = env._foot_contact_sensor.data.net_forces_w
+        hip_body_names = ["LL_HFE", "RL_HFE", "LL_HAA", "RL_HAA"]
+        hip_body_indices = []
+        for name in hip_body_names:
+            bodies, _ = env.robot.find_bodies([name])
+            if len(bodies) > 0:
+                hip_body_indices.append(int(bodies[0]))
+        if hip_body_indices and hasattr(env._foot_contact_sensor, "body_ids"):
+            sensor_body_ids = env._foot_contact_sensor.body_ids
+            hip_sensor_indices = [i for i, body_id in enumerate(sensor_body_ids) if body_id in hip_body_indices]
+            if hip_sensor_indices:
+                hip_forces = forces[:, hip_sensor_indices, :]
+                contact_threshold = 1.0
+                hip_contacts = torch.norm(hip_forces, dim=-1) > contact_threshold
+                rew_undesired_contacts = env.cfg.rew_scale_undesired_contacts * torch.sum(hip_contacts.float(), dim=1)
+
+    # joint deviation penalties
+    hip_pos = current_pos[:, [env._controlled_joint_indices.index(i) for i in env._hip_joint_indices]]
+    hip_target = env._hip_target.unsqueeze(0).expand_as(hip_pos)
+    hip_deviation = torch.abs(hip_pos - hip_target)
+    rew_joint_deviation_hip = env.cfg.rew_scale_joint_deviation_hip * torch.sum(hip_deviation, dim=1)
+
+    kfe_joint_names = ["LL_joint4", "RL_joint4"]
+    kfe_only_indices = []
+    for name in kfe_joint_names:
+        joint_ids, _ = env.robot.find_joints([name])
+        if len(joint_ids) > 0 and joint_ids[0] in env._controlled_joint_indices:
+            kfe_only_indices.append(env._controlled_joint_indices.index(joint_ids[0]))
+    if kfe_only_indices:
+        knee_pos = current_pos[:, kfe_only_indices]
+        knee_target = torch.tensor(
+            [env.cfg.target_joint_pos[name] for name in kfe_joint_names],
+            device=env.device
+        ).unsqueeze(0).expand_as(knee_pos)
+        knee_deviation = torch.abs(knee_pos - knee_target)
+        rew_joint_deviation_knee = env.cfg.rew_scale_joint_deviation_knee * torch.sum(knee_deviation, dim=1)
+    else:
+        rew_joint_deviation_knee = torch.zeros(env.scene.num_envs, device=env.device)
+
+    # Forward distance progress
+    root_x = env.robot.data.root_pos_w[:, 0]
+    delta_x = torch.clamp(root_x - env._prev_root_x, min=0.0)
+    env._cum_forward_x = env._cum_forward_x + delta_x
+    env._prev_root_x = root_x
+    rew_forward_distance = getattr(env.cfg, "rew_scale_forward_distance", 0.0) * env._cum_forward_x
+
+    total_reward = (
+        rew_track_lin_vel_xy
+        + rew_track_ang_vel_z
+        + rew_feet_air_time
+        + rew_feet_slide
+        + rew_lin_vel_z
+        + rew_ang_vel_xy
+        + rew_flat_orientation
+        + rew_joint_torques
+        + rew_action_rate
+        + rew_undesired_contacts
+        + rew_joint_deviation_hip
+        + rew_joint_deviation_knee
+        + rew_leg_lift
+        + rew_forward_distance
+    )
+
+    # Logging (two categories + progress)
+    if env._tb_step % 32 == 0:
+        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_feet_air_time + rew_leg_lift + rew_forward_distance)
+        penalty_total = -(rew_lin_vel_z + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide)
+        env._tb_writer.add_scalar("reward/total", total_reward.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("reward/task", task_reward.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("penalty/total", penalty_total.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("progress/forward_delta_x", delta_x.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("progress/forward_cumulative_x", env._cum_forward_x.mean().item(), env._tb_step)
+
+    # curriculum update
+    cmd_error = base_lin_vel[:, :2] - env._command[:, :2]
+    cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
+    gait_stats = compute_gait_rewards(env, root_state)
+    if env.curriculum.update(env._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean):
+        env._sample_commands(None)
+
+    env._prev_actions = env.actions.clone()
+    env._tb_step += 1
+    return total_reward
+
+

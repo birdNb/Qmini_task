@@ -122,8 +122,8 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 
 
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
-    size=(8.0, 8.0),
-    border_width=20.0,
+    size=(4.0, 4.0),            # 缩小为原来的一半
+    border_width=0.0,           # 去掉周围平地边界，只保留地形区域
     num_rows=10,
     num_cols=20,
     horizontal_scale=0.1,
@@ -252,21 +252,23 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # reward scales - Gait Training Rewards (following reference implementation)
     # 1. Task Rewards
-    rew_scale_track_lin_vel_xy = 1.0      # track_lin_vel_xy_exp: weight=1.0
+    rew_scale_track_lin_vel_xy = 2.5      # stronger speed tracking 
+    
     rew_scale_track_ang_vel_z = 0.5      # track_ang_vel_z_exp: weight=0.5
 
     # 2. Gait Rewards
-    rew_scale_feet_air_time = 2.0        # feet_air_time: weight=2.0 (核心步态奖励)
-    rew_scale_feet_slide = -0.25         # feet_slide: weight=-0.25 (惩罚滑动)
+    rew_scale_feet_air_time = 8.0        # 提高“腾空时间”奖励权重
+    rew_scale_feet_slide = -0.1          # 初期放松滑动惩罚
+    rew_scale_leg_lift = 2.0             # 抬腿高度奖励更强
 
     # 3. Stability Penalties
-    rew_scale_lin_vel_z = -2.0          # lin_vel_z_l2: weight=-2.0 (惩罚垂直速度)
-    rew_scale_ang_vel_xy = -0.05        # ang_vel_xy_l2: weight=-0.05 (惩罚俯仰/滚转)
-    rew_scale_flat_orientation = -0.5    # flat_orientation_l2: weight=-0.5 (惩罚倾斜)
+    rew_scale_lin_vel_z = -1.0          # 先松后紧
+    rew_scale_ang_vel_xy = -0.02        # 先松后紧
+    rew_scale_flat_orientation = -0.25   # 先松后紧
 
     # 4. Action Penalties
     rew_scale_joint_torques = -1.0e-5    # joint_torques_l2: weight=-1e-5 (惩罚力矩)
-    rew_scale_action_rate = -0.01       # action_rate_l2: weight=-0.01 (惩罚动作变化)
+    rew_scale_action_rate = -0.005      # 初期放松，便于探索
 
     # 5. Contact Penalties
     rew_scale_undesired_contacts = -1.0  # undesired_contacts: weight=-1.0 (惩罚不当接触)
@@ -284,11 +286,12 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
 
-    desired_root_height = 0.4       # 目标机身高度 [m]
-    foot_contact_force_threshold = 5.0  # 足底接触判定阈值 [N]
-    desired_foot_clearance = 0.05   # 摆动腿目标离地高度 [m]
+    desired_root_height = 0.35       # 目标机身高度 [m]
+    foot_contact_force_threshold = 1.0  # 足底接触判定阈值 [N]
+    desired_foot_clearance = 0.07   # 摆动腿目标离地高度 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
+    rew_scale_forward_distance = 20.0    # 累积前向距离高额奖励（起步强）
     # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
     joint_velocity_limits = (
         1.0,   # LL_joint1
@@ -304,7 +307,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     )
 
     # command profile
-    command_lin_vel_x_range = (0.0, 0.8)
+    command_lin_vel_x_range = (0.3, 0.8)
     command_lin_vel_y_range = (0.0, 0.0)
     command_yaw_range = (0.0, 0.0)
     command_change_interval_s = 2.0
