@@ -512,7 +512,12 @@ class QminiTaskEnv(DirectRLEnv):
         joint_vel[:, self._controlled_joint_indices] = 0.0
 
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        # Add random position offset to disperse robots during reset
+        # Use 80% of env_spacing to ensure robots stay within their environment region
+        position_noise_scale = self.cfg.scene.env_spacing * 0.4
+        position_noise = (torch.rand(len(env_ids), 3, device=default_root_state.device) - 0.5) * 2.0 * position_noise_scale
+        position_noise[:, 2] = 0.0  # Don't add noise to Z (height)
+        default_root_state[:, :3] += self.scene.env_origins[env_ids] + position_noise
         default_root_state[:, 7:] = 0.0
 
         if self._orientation_noise > 0.0:

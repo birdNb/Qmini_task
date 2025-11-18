@@ -592,8 +592,8 @@ def compute_total_reward(env) -> torch.Tensor:
     gravity_error = projected_gravity - gravity_world
     rew_flat_orientation = getattr(env.cfg, "rew_scale_flat_orientation", -1.0) * torch.sum(gravity_error ** 2, dim=1)
 
-    # Base height penalty (reference: weight=-10.0, target_height=0.15)
-    target_height = getattr(env.cfg, "desired_root_height", 0.15)
+    # Base height penalty (reference: weight=-10.0, target_height=0.35)
+    target_height = getattr(env.cfg, "desired_root_height", 0.35)
     height_error = base_height - target_height
     rew_base_height = getattr(env.cfg, "rew_scale_base_height", -10.0) * height_error ** 2
 

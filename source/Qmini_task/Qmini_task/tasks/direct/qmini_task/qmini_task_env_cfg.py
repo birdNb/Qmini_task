@@ -245,7 +245,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_feet_slide = -0.3            # Reference: -0.3 (feet_slide)
     rew_scale_leg_lift = 0.99              # Reference: 0.99 (feet_clearance, target_height: 0.05)
     rew_scale_feet_contact_forces = -0.2  # Reference: -0.2 (feet_contact_forces, threshold: 100)
-    
+
     # Gait parameters for compute_feet_gait
     gait_offset = [0.0, 0.5]              # Reference: offset=[0.0, 0.5]
     gait_threshold = 0.55                  # Reference: threshold=0.55
@@ -263,7 +263,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     success_upright_cos = 0.98
     success_pitch_tol = math.radians(5.0)
     failure_pitch_angle = math.radians(45.0)
-    failure_min_height = 0.10  # Reference: 0.10 (base_height termination)
+    failure_min_height = 0.25  # Reset when root height below 0.3m
     imbalance_pitch_threshold = math.radians(30.0)  # [rad] 失衡惩罚阈值（pitch角度）
     imbalance_roll_threshold = math.radians(30.0)    # [rad] 失衡惩罚阈值（roll角度）
     imbalance_height_threshold = 0.15  # Reference: 0.15 (base_height target)
@@ -272,7 +272,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
 
-    desired_root_height = 0.15       # Reference: 0.15 (base_height target)
+    desired_root_height = 0.35       # Base height target: 0.35m
     foot_contact_force_threshold = 100.0  # Reference: 100 (feet_contact_forces threshold)
     desired_foot_clearance = 0.05    # Reference: 0.05 (feet_clearance target_height)
     leg_lift_exploration_threshold = 0.02  # 抬腿探索奖励阈值 [m]
@@ -348,7 +348,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
                 dynamic_friction=1.0,  # Reference: 1.0
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.2, 0.4, 0.2),  # Gray color for terrain
+                diffuse_color=(0.4, 0.4, 0.4),  # Gray color for terrain
                 roughness=0.8,
                 metallic=0.0,
             ),
