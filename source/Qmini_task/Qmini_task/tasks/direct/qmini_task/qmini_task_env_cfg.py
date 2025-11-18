@@ -122,46 +122,17 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 
 
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
-    size=(4.0, 4.0),            # 缩小为原来的一半
-    border_width=0.0,           # 去掉周围平地边界，只保留地形区域
-    num_rows=10,
-    num_cols=20,
+    size=(8.0, 8.0),  # Reference: (8.0, 8.0)
+    border_width=20.0,  # Reference: 20.0
+    num_rows=9,  # Reference: 9
+    num_cols=21,  # Reference: 21
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),  # Reference: (0.0, 1.0)
     use_cache=False,
     sub_terrains={
-        "flat": terrain_gen.MeshPlaneTerrainCfg(
-            proportion=0.3,
-        ),
-        "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
-            proportion=0.1, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
-        ),
-        "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
-            proportion=0.1, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
-        ),
-        "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
-            proportion=0.05,
-            step_height_range=(0.0, 0.1),
-            step_width=0.3,
-            platform_width=3.0,
-            border_width=1.0,
-            holes=False,
-        ),
-        "pyramid_stairs_inv": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
-            proportion=0.05,
-            step_height_range=(0.0, 0.1),
-            step_width=0.3,
-            platform_width=3.0,
-            border_width=1.0,
-            holes=False,
-        ),
-        "wave_terrain": terrain_gen.HfWaveTerrainCfg(
-            proportion=0.2, amplitude_range=(0.0, 0.2), num_waves=4, border_width=0.25
-        ),
-        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.2, noise_range=(0.0, 0.06), noise_step=0.02, border_width=0.25
-        ),
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.5),  # Reference: only flat terrain with proportion=0.5
     },
 )
 
@@ -173,7 +144,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0  # Reference: 20.0 (increased from 10.0)
     # - spaces definition
     action_space = 10
-    observation_space = 42  # Updated to 42 dimensions
+    observation_space = 43  # Reference: 3+3+3+3+10+10+10+1 = 43 (added gait_phase)
     state_space = 0
 
     # simulation - Following reference configuration
@@ -273,9 +244,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_feet_air_time = 0.5         # Reference: 0.5 (gait, period: 0.6)
     rew_scale_feet_slide = -0.3            # Reference: -0.3 (feet_slide)
     rew_scale_leg_lift = 0.99              # Reference: 0.99 (feet_clearance, target_height: 0.05)
-    rew_scale_leg_lift_velocity = 0.0     # Not in reference
-    rew_scale_both_feet_contact = 0.0     # Not in reference
     rew_scale_feet_contact_forces = -0.2  # Reference: -0.2 (feet_contact_forces, threshold: 100)
+    
+    # Gait parameters for compute_feet_gait
+    gait_offset = [0.0, 0.5]              # Reference: offset=[0.0, 0.5]
+    gait_threshold = 0.55                  # Reference: threshold=0.55
+    feet_clearance_std = 0.05              # Reference: std=0.05
+    feet_clearance_tanh_mult = 2.0        # Reference: tanh_mult=2.0
 
     # 5. Contact Penalties - Reference weights
     rew_scale_undesired_contacts = -1.0   # Reference: -1.0 (undesired_contacts)
@@ -320,29 +295,11 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         1.0,   # RL_joint5
     )
 
-    # command profile - Following reference configuration
-    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: (-0.5, 0.5)
-    command_lin_vel_y_range = (-0.2, 0.2)  # Reference: (-0.2, 0.2)
-    command_yaw_range = (-0.1, 0.1)  # Reference: ang_vel_z (-0.1, 0.1)
-    command_change_interval_s = 10.0  # Reference: resampling_time_range (10.0, 10.0)
-
-    # Curriculum learning configuration (G1 style: multi-phase training)
-    curriculum_enabled = True
-    curriculum_lin_vel_x_schedule = (
-        (0.0, 0.0),      # Phase 0: Standing (no forward motion)
-        (0.0, 0.3),      # Phase 1: Slow walking
-        (0.2, 0.5),      # Phase 2: Medium walking
-        (0.3, 0.8),      # Phase 3: Fast walking (final target)
-    )
-    curriculum_phase_durations = (
-        300.0,  # Phase 0: 300s standing
-        600.0,  # Phase 1: 600s slow walking
-        1200.0, # Phase 2: 1200s medium walking
-        # Phase 3: continue indefinitely
-    )
-    curriculum_height_threshold = 0.32  # Minimum height to advance phase
-    curriculum_single_leg_threshold = 0.15  # Minimum single leg support rate
-    curriculum_cmd_error_threshold = 0.5  # Maximum velocity tracking error
+    # command profile - Following reference configuration (no curriculum)
+    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: ranges.lin_vel_x=(-0.5, 0.5)
+    command_lin_vel_y_range = (-0.2, 0.2)  # Reference: ranges.lin_vel_y=(-0.2, 0.2)
+    command_yaw_range = (-0.1, 0.1)  # Reference: ranges.ang_vel_z=(-0.1, 0.1)
+    command_change_interval_s = 10.0  # Reference: resampling_time_range=(10.0, 10.0)
 
     # gait parameters - Following reference configuration
     gait_cycle_duration = 0.6  # Reference: period=0.6 (gait reward)

@@ -19,9 +19,6 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.utils.math as math_utils
 
-from .gait_curriculum import OmniGaitCurriculum
-from .reward import compute_gait_rewards, compute_feet_air_time, compute_feet_slide, compute_leg_lift
-
 from .qmini_task_env_cfg import QminiTaskEnvCfg
 
 
@@ -147,7 +144,6 @@ class QminiTaskEnv(DirectRLEnv):
         self._setup_visual_markers()
         self._visualize_markers()
 
-        self.curriculum = OmniGaitCurriculum(self.cfg, self.device)
         # forward distance accumulators (initialized on first reset)
         self._prev_root_x = None
         self._cum_forward_x = None
@@ -252,10 +248,10 @@ class QminiTaskEnv(DirectRLEnv):
         if env_ids_t.numel() == 0:
             return
 
-        x_range, y_range, yaw_range = self.curriculum.get_command_ranges()
-        x_min, x_max = x_range
-        y_min, y_max = y_range
-        yaw_min, yaw_max = yaw_range
+        # Use fixed command ranges (no curriculum)
+        x_min, x_max = self.cfg.command_lin_vel_x_range
+        y_min, y_max = self.cfg.command_lin_vel_y_range
+        yaw_min, yaw_max = self.cfg.command_yaw_range
 
         rand_vals = torch.rand((env_ids_t.numel(), 3), device=self.device)
         self._command[env_ids_t, 0] = x_min + (x_max - x_min) * rand_vals[:, 0]
@@ -295,7 +291,8 @@ class QminiTaskEnv(DirectRLEnv):
 
         cmd_xy = self._command[:, :2]
         cmd_speed = torch.norm(cmd_xy, dim=1)
-        x_range, y_range, _ = self.curriculum.get_command_ranges()
+        x_range = self.cfg.command_lin_vel_x_range
+        y_range = self.cfg.command_lin_vel_y_range
         max_speed = max(1e-6, abs(x_range[0]), abs(x_range[1]), abs(y_range[0]), abs(y_range[1]))
         speed_gain = torch.clamp(cmd_speed / max_speed, 0.0, 1.0)
 
@@ -424,16 +421,16 @@ class QminiTaskEnv(DirectRLEnv):
         base_lin_vel_noise = torch.rand_like(base_lin_vel) * 0.2 - 0.1
         obs_base_lin_vel = base_lin_vel + base_lin_vel_noise
 
-        # 2. base_ang_vel (3 dims) - with noise ±0.2
+        # 2. base_ang_vel (3 dims) - Reference: scale=0.2, noise=(-0.2, 0.2)
         base_ang_vel_noise = torch.rand_like(base_ang_vel) * 0.4 - 0.2
-        obs_base_ang_vel = base_ang_vel + base_ang_vel_noise
+        obs_base_ang_vel = base_ang_vel * 0.2 + base_ang_vel_noise  # Reference: scale=0.2
 
-        # 3. projected_gravity (3 dims) - gravity vector in base frame
+        # 3. projected_gravity (3 dims) - Reference: noise=(-0.05, 0.05)
         # Gravity in world frame: [0, 0, -1] (normalized)
         gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
         # Rotate gravity to base frame using quaternion
         projected_gravity = math_utils.quat_apply_inverse(base_quat, gravity_world)
-        projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05
+        projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05  # Reference: noise=(-0.05, 0.05)
         obs_projected_gravity = projected_gravity + projected_gravity_noise
 
         # 4. velocity_commands (3 dims) - [target_vx, target_vy, target_ωz]
@@ -443,44 +440,35 @@ class QminiTaskEnv(DirectRLEnv):
         velocity_commands[:, 1] = self._command[:, 1]  # vy
         velocity_commands[:, 2] = self._command[:, 2]  # yaw (used as ωz)
 
-        # 5. hip_pos (2 dims) - HR joints relative to target, noise ±0.03
-        hip_pos = self.joint_pos[:, self._hip_joint_indices]
-        hip_pos_rel = hip_pos - self._hip_target.unsqueeze(0)
-        hip_pos_noise = torch.rand_like(hip_pos_rel) * 0.06 - 0.03
-        obs_hip_pos = hip_pos_rel + hip_pos_noise
+        # 5. joint_pos_rel (10 dims) - Reference: noise=(-0.01, 0.01)
+        all_joint_pos = self.joint_pos[:, self._controlled_joint_indices]
+        all_joint_pos_rel = all_joint_pos - self._target_pos.unsqueeze(0)
+        joint_pos_noise = torch.rand_like(all_joint_pos_rel) * 0.02 - 0.01  # Reference: noise=(-0.01, 0.01)
+        obs_joint_pos_rel = all_joint_pos_rel + joint_pos_noise
 
-        # 6. kfe_pos (6 dims) - HAA+HFE+KFE joints relative to target, noise ±0.05
-        kfe_pos = self.joint_pos[:, self._kfe_joint_indices]
-        kfe_pos_rel = kfe_pos - self._kfe_target.unsqueeze(0)
-        kfe_pos_noise = torch.rand_like(kfe_pos_rel) * 0.1 - 0.05
-        obs_kfe_pos = kfe_pos_rel + kfe_pos_noise
-
-        # 7. ffe_pos (2 dims) - FFE joints relative to target, noise ±0.08
-        ffe_pos = self.joint_pos[:, self._ffe_joint_indices]
-        ffe_pos_rel = ffe_pos - self._ffe_target.unsqueeze(0)
-        ffe_pos_noise = torch.rand_like(ffe_pos_rel) * 0.16 - 0.08
-        obs_ffe_pos = ffe_pos_rel + ffe_pos_noise
-
-        # 8. joint_vel (10 dims) - All joint velocities, noise ±1.5
+        # 6. joint_vel_rel (10 dims) - Reference: scale=0.05, noise=(-1.5, 1.5)
         joint_vel = self.joint_vel[:, self._controlled_joint_indices]
-        joint_vel_noise = torch.rand_like(joint_vel) * 3.0 - 1.5
-        obs_joint_vel = joint_vel + joint_vel_noise
+        joint_vel_noise = torch.rand_like(joint_vel) * 3.0 - 1.5  # Reference: noise=(-1.5, 1.5)
+        obs_joint_vel = joint_vel * 0.05 + joint_vel_noise  # Reference: scale=0.05
 
-        # 9. actions (10 dims) - Previous action (no noise)
+        # 7. last_action (10 dims) - Reference: last_action
         obs_actions = self._prev_actions
 
-        # Concatenate all observations: 3+3+3+3+2+6+2+10+10 = 42 dims
+        # 8. gait_phase (1 dim) - Reference: gait_phase, period=0.6
+        gait_phase_normalized = (self._gait_phase / (2.0 * math.pi)) % 1.0  # Normalize to [0, 1)
+        obs_gait_phase = gait_phase_normalized.unsqueeze(1)  # [N, 1]
+
+        # Concatenate all observations: 3+3+3+3+10+10+10+1 = 43 dims (updated from 42)
         obs = torch.cat(
             (
                 obs_base_lin_vel,      # 3
                 obs_base_ang_vel,       # 3
                 obs_projected_gravity,  # 3
                 velocity_commands,      # 3
-                obs_hip_pos,            # 2
-                obs_kfe_pos,            # 6
-                obs_ffe_pos,            # 2
-                obs_joint_vel,          # 10
-                obs_actions,            # 10
+                obs_joint_pos_rel,      # 10 (Reference: joint_pos_rel)
+                obs_joint_vel,          # 10 (Reference: joint_vel_rel)
+                obs_actions,            # 10 (Reference: last_action)
+                obs_gait_phase,         # 1 (Reference: gait_phase)
             ),
             dim=1,
         )
@@ -511,9 +499,6 @@ class QminiTaskEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
-
-        if self.curriculum.enabled and len(env_ids) == self.scene.num_envs:
-            self.curriculum.reset()
 
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids].clone()

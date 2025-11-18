@@ -44,188 +44,197 @@ def compute_gait_rewards(env, root_state: torch.Tensor) -> Dict[str, torch.Tenso
     }
 
 
-def compute_feet_air_time(env, threshold_min: float = 0.2, threshold_max: float = 0.5) -> torch.Tensor:
-    """Compute reward for feet air time (using left/right ankle contact sensors when available)."""
+def compute_feet_gait(env, period: float = 0.6, offset: list[float] = [0.0, 0.5], threshold: float = 0.55) -> torch.Tensor:
+    """Compute gait reward based on contact pattern matching expected gait phase.
+    
+    Reference: mdp.feet_gait with period=0.6, offset=[0.0, 0.5], threshold=0.55
+    """
+    import math
     device = env.device
     num_envs = env.scene.num_envs
-    sensors_dict = getattr(env.scene, "sensors", {})
-    left = sensors_dict.get("contact_forces_left", None)
-    right = sensors_dict.get("contact_forces_right", None)
-    combined = sensors_dict.get("contact_forces", None)
-
-    rewards = torch.zeros(num_envs, device=device)
-    sensor_list = []
-    if left is not None:
-        sensor_list.append(left)
-    if right is not None:
-        sensor_list.append(right)
-    if not sensor_list and combined is not None:
-        sensor_list.append(combined)
-    if not sensor_list:
-        return rewards
-
-    for s in sensor_list:
-        if not hasattr(s, "data"):
-            continue
-        # first_contact mask
+    
+    # Get contact sensor (ankle bodies)
+    sensors = getattr(env.scene, "sensors", {})
+    left = sensors.get("contact_forces_left", None)
+    right = sensors.get("contact_forces_right", None)
+    
+    # Get contact states for both feet
+    def get_contact_state(sensor) -> torch.Tensor:
+        if sensor is None or not hasattr(sensor, "data"):
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
         try:
-            first_contact = s.compute_first_contact(env.step_dt)
-        except Exception:
-            # fallback: use force threshold at current step
-            forces = getattr(s.data, "net_forces_w", None)
+            forces = sensor.data.net_forces_w
             if forces is None:
-                continue
-            first_contact = (torch.norm(forces, dim=-1) > max(getattr(env, "_foot_contact_threshold", 5.0), 1e-3)).float()
-        # last_air_time
-        lat = getattr(s.data, "last_air_time", None)
-        if lat is None:
-            continue
-        # Sensors may report shape [N, 1] or [N, B]; reduce along bodies
-        while lat.dim() < 2:
-            lat = lat.unsqueeze(1)
-        while first_contact.dim() < 2:
-            first_contact = first_contact.unsqueeze(1)
-        air_time = (lat - threshold_min) * first_contact
-        air_time = torch.clamp(air_time, max=threshold_max - threshold_min)
-        rewards = rewards + air_time.sum(dim=1)
-
-    # gate by commanded motion (optional)
-    command = getattr(env, "_command", None)
-    if command is not None:
-        cmd_vel_xy = torch.norm(command[:, :2], dim=1)
-        rewards = rewards * (cmd_vel_xy > 0.1).float()
-    return rewards
+                return torch.zeros(num_envs, device=device, dtype=torch.bool)
+            # Sum over bodies if multiple
+            force_norm = torch.norm(forces, dim=-1)  # [N, B] or [N]
+            if force_norm.dim() > 1:
+                force_norm = force_norm.sum(dim=1)  # [N]
+            return force_norm > getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+        except Exception:
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
+    
+    left_contact = get_contact_state(left)
+    right_contact = get_contact_state(right)
+    
+    # Get normalized gait phase [0, 1)
+    gait_phase = env._gait_phase  # [N] - already in [0, 2π)
+    phase_normalized = (gait_phase / (2.0 * math.pi)) % 1.0  # [0, 1)
+    
+    # Expected contact pattern based on phase
+    # offset[0] for left, offset[1] for right
+    left_phase = (phase_normalized + offset[0]) % 1.0
+    right_phase = (phase_normalized + offset[1]) % 1.0
+    
+    # Expected contact: 1 if in contact phase, 0 if in swing phase
+    # Contact phase is when phase is in [0, 0.5) (half cycle)
+    left_expected = (left_phase < 0.5).float()
+    right_expected = (right_phase < 0.5).float()
+    
+    # Actual contact states
+    left_actual = left_contact.float()
+    right_actual = right_contact.float()
+    
+    # Match quality: how well actual matches expected
+    left_match = 1.0 - torch.abs(left_actual - left_expected)
+    right_match = 1.0 - torch.abs(right_actual - right_expected)
+    
+    # Average match quality
+    match_quality = (left_match + right_match) / 2.0
+    
+    # Reward when match quality exceeds threshold
+    reward = (match_quality > threshold).float()
+    
+    return reward
 
 
 def compute_feet_slide(env) -> torch.Tensor:
-    """Compute penalty for feet sliding during contact using left/right sensors when available."""
-    device = env.device
-    num_envs = env.scene.num_envs
-    sensors = getattr(env.scene, "sensors", {})
-    left = sensors.get("contact_forces_left", None)
-    right = sensors.get("contact_forces_right", None)
-    combined = sensors.get("contact_forces", None)
-
-    total_penalty = torch.zeros(num_envs, device=device)
-    used = False
-    for s in [left, right] if (left or right) else [combined]:
-        if s is None or not hasattr(s, "data"):
-            continue
-        used = True
-        # contact mask
-        try:
-            hist = s.data.net_forces_w_history  # [N, H, B, 3]
-            contacts = hist.norm(dim=-1).max(dim=1)[0] > 1.0
-        except Exception:
-            forces = s.data.net_forces_w
-            if forces is None:
-                continue
-            contacts = torch.norm(forces, dim=-1) > 1.0
-        # velocities
-        robot = env.robot
-        try:
-            sensor_body_ids = s.body_ids
-            vel = robot.data.body_lin_vel_w[:, sensor_body_ids, :2]
-        except Exception:
-            # fallback: take the first B bodies
-            b = contacts.shape[1]
-            vel = robot.data.body_lin_vel_w[:, :b, :2]
-        total_penalty = total_penalty + torch.sum(vel.norm(dim=-1) * contacts.float(), dim=1)
-    if not used:
-        return torch.zeros(num_envs, device=device)
-    return total_penalty
-
-
-def compute_leg_lift(env, clearance: float = 0.05) -> torch.Tensor:
-    """Reward lifting swing legs above a clearance height when not in contact.
-
-    Uses left/right ankle sensors (preferred) or combined sensor as fallback.
-    Optimized with staged rewards and improved single support detection.
+    """Compute penalty for feet sliding during contact.
+    
+    Reference: mdp.feet_slide with ankle bodies
     """
     device = env.device
     num_envs = env.scene.num_envs
+    
+    # Find ankle body indices
+    ankle_names = ["LL_ankle", "RL_ankle"]
+    ankle_indices = []
+    for name in ankle_names:
+        ids, _ = env.robot.find_bodies([name])
+        if len(ids) > 0:
+            ankle_indices.append(int(ids[0]))
+    
+    if not ankle_indices:
+        return torch.zeros(num_envs, device=device)
+    
+    # Get contact sensors
     sensors = getattr(env.scene, "sensors", {})
     left = sensors.get("contact_forces_left", None)
     right = sensors.get("contact_forces_right", None)
-    combined = sensors.get("contact_forces", None)
-
-    # Determine ankle body indices on robot
-    ankle_names = ["LL_ankle", "RL_ankle"]
-    ankle_indices: list[int] = []
-    for name in ankle_names:
-        ids, _ = env.robot.find_bodies([name])
-        ankle_indices.append(int(ids[0]) if len(ids) > 0 else -1)
-
-    body_pos_w = env.robot.data.body_pos_w  # [N, bodies, 3]
-    reward = torch.zeros(num_envs, device=env.device)
-
-    # Get contact force threshold and height difference threshold
-    force_threshold = getattr(env.cfg, "foot_contact_force_threshold", 1.0)
-    height_diff_threshold = getattr(env.cfg, "single_support_height_diff", 0.03)
-    exploration_threshold = getattr(env.cfg, "leg_lift_exploration_threshold", 0.02)
-
-    def sensor_to_contact_mask(sensor) -> torch.Tensor | None:
+    
+    def get_contact_mask(sensor) -> torch.Tensor:
         if sensor is None or not hasattr(sensor, "data"):
-            return None
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
         try:
-            hist = sensor.data.net_forces_w_history
-            return (hist.norm(dim=-1).max(dim=1)[0] > force_threshold).float()  # [N, B]
-        except Exception:
             forces = sensor.data.net_forces_w
             if forces is None:
-                return None
-            return (torch.norm(forces, dim=-1) > force_threshold).float()
-
-    # Build per-ankle contact mask
-    left_mask = sensor_to_contact_mask(left)
-    right_mask = sensor_to_contact_mask(right)
-    if left_mask is None and right_mask is None and combined is not None:
-        cmask = sensor_to_contact_mask(combined)
-        if cmask is not None:
-            if cmask.shape[1] >= 2:
-                left_mask, right_mask = cmask[:, 0:1], cmask[:, 1:2]
-            else:
-                left_mask, right_mask = cmask, cmask
-
-    # Get ankle heights
-    left_height = body_pos_w[:, ankle_indices[0], 2] if ankle_indices[0] >= 0 else torch.zeros(num_envs, device=device)
-    right_height = body_pos_w[:, ankle_indices[1], 2] if ankle_indices[1] >= 0 else torch.zeros(num_envs, device=device)
-    height_diff = torch.abs(left_height - right_height)
-
-    # Improved single support detection: contact + small height difference
-    for i, (idx, m) in enumerate(zip(ankle_indices, [left_mask, right_mask])):
+                return torch.zeros(num_envs, device=device, dtype=torch.bool)
+            force_norm = torch.norm(forces, dim=-1)
+            if force_norm.dim() > 1:
+                force_norm = force_norm.sum(dim=1)
+            return force_norm > getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+        except Exception:
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
+    
+    left_contact = get_contact_mask(left)
+    right_contact = get_contact_mask(right)
+    
+    # Get ankle velocities (horizontal plane only)
+    body_vel = env.robot.data.body_lin_vel_w  # [N, bodies, 3]
+    total_penalty = torch.zeros(num_envs, device=device)
+    
+    for i, (idx, contact_mask) in enumerate(zip(ankle_indices, [left_contact, right_contact])):
         if idx < 0:
             continue
-        z = body_pos_w[:, idx, 2]
+        # Horizontal velocity (xy plane)
+        vel_xy = body_vel[:, idx, :2]  # [N, 2]
+        vel_norm = torch.norm(vel_xy, dim=1)  # [N]
+        # Penalty only when in contact
+        penalty = vel_norm * contact_mask.float()
+        total_penalty = total_penalty + penalty
+    
+    return total_penalty
 
-        # Determine if this leg is in contact (convert to boolean)
-        if m is None:
-            is_contact = torch.zeros(num_envs, device=device, dtype=torch.bool)
-        else:
-            is_contact = (torch.clamp(m.squeeze(-1), 0.0, 1.0) > 0.5)
 
-        # Improved swing detection: not in contact OR (in contact but height difference is large)
-        # This prevents misclassifying swing leg as support leg
-        is_support = is_contact & (height_diff < height_diff_threshold)
-        swing = (~is_support).float()
-
-        # Staged reward: from exploration_threshold (0.02m) start giving reward
-        # Full reward at clearance (0.04m)
-        lift_above_exploration = torch.clamp(z - exploration_threshold, min=0.0)
-        lift_above_clearance = torch.clamp(z - clearance, min=0.0)
-
-        # Linear interpolation: more reward as height increases
-        # At exploration_threshold: reward = 0
-        # At clearance: reward = lift_above_clearance
-        # Between: linear interpolation
-        if clearance > exploration_threshold:
-            exploration_scale = lift_above_exploration / (clearance - exploration_threshold + 1e-6)
-            exploration_scale = torch.clamp(exploration_scale, 0.0, 1.0)
-            staged_lift = exploration_scale * lift_above_clearance + (1.0 - exploration_scale) * lift_above_exploration * 0.5
-        else:
-            staged_lift = lift_above_clearance
-
-        reward = reward + staged_lift * swing
+def compute_foot_clearance_reward(env, std: float = 0.05, tanh_mult: float = 2.0, target_height: float = 0.05) -> torch.Tensor:
+    """Reward for foot clearance during swing phase.
+    
+    Reference: mdp.foot_clearance_reward with std=0.05, tanh_mult=2.0, target_height=0.05
+    Uses tanh-based reward centered at target_height with std as scale.
+    """
+    device = env.device
+    num_envs = env.scene.num_envs
+    
+    # Find ankle body indices
+    ankle_names = ["LL_ankle", "RL_ankle"]
+    ankle_indices = []
+    for name in ankle_names:
+        ids, _ = env.robot.find_bodies([name])
+        if len(ids) > 0:
+            ankle_indices.append(int(ids[0]))
+    
+    if not ankle_indices:
+        return torch.zeros(num_envs, device=device)
+    
+    # Get contact sensors
+    sensors = getattr(env.scene, "sensors", {})
+    left = sensors.get("contact_forces_left", None)
+    right = sensors.get("contact_forces_right", None)
+    
+    def get_contact_mask(sensor) -> torch.Tensor:
+        if sensor is None or not hasattr(sensor, "data"):
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
+        try:
+            forces = sensor.data.net_forces_w
+            if forces is None:
+                return torch.zeros(num_envs, device=device, dtype=torch.bool)
+            force_norm = torch.norm(forces, dim=-1)
+            if force_norm.dim() > 1:
+                force_norm = force_norm.sum(dim=1)
+            return force_norm > getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+        except Exception:
+            return torch.zeros(num_envs, device=device, dtype=torch.bool)
+    
+    left_contact = get_contact_mask(left)
+    right_contact = get_contact_mask(right)
+    
+    # Get ankle heights relative to ground (assuming ground at z=0)
+    body_pos_w = env.robot.data.body_pos_w  # [N, bodies, 3]
+    reward = torch.zeros(num_envs, device=device)
+    
+    for idx, contact_mask in zip(ankle_indices, [left_contact, right_contact]):
+        if idx < 0:
+            continue
+        
+        # Get ankle height (relative to ground, assuming ground at z=0)
+        ankle_height = body_pos_w[:, idx, 2]  # [N]
+        
+        # Only reward when not in contact (swing phase)
+        swing_mask = (~contact_mask).float()
+        
+        # Compute clearance reward using tanh function
+        # Reference: mdp.foot_clearance_reward
+        # Reward when foot height is close to target_height during swing
+        height_diff = ankle_height - target_height
+        # Normalize by std: reward peaks when height_diff is close to 0
+        normalized_diff = height_diff / (std + 1e-6)
+        # Apply tanh: creates smooth reward that peaks at target_height
+        # tanh_mult controls the steepness of the reward curve
+        clearance_reward = torch.tanh(tanh_mult * torch.exp(-normalized_diff ** 2))
+        
+        # Only apply reward during swing phase
+        reward = reward + clearance_reward * swing_mask
+    
     return reward
 
 
@@ -531,44 +540,43 @@ def compute_total_reward(env) -> torch.Tensor:
     # Alive reward (reference: weight=0.3)
     rew_alive = getattr(env.cfg, "rew_scale_alive", 0.3) * torch.ones(env.scene.num_envs, device=env.device)
 
-    # 2) Gait rewards
-    rew_feet_air_time = env.cfg.rew_scale_feet_air_time * compute_feet_air_time(
-        env, threshold_min=0.05, threshold_max=0.5
+    # 2) Gait rewards - Following reference configuration
+    # Gait reward (reference: weight=0.5, period=0.6, offset=[0.0, 0.5], threshold=0.55)
+    gait_period = getattr(env.cfg, "gait_cycle_duration", 0.6)
+    gait_offset = getattr(env.cfg, "gait_offset", [0.0, 0.5])
+    gait_threshold = getattr(env.cfg, "gait_threshold", 0.55)
+    rew_gait = getattr(env.cfg, "rew_scale_feet_air_time", 0.5) * compute_feet_gait(
+        env, period=gait_period, offset=gait_offset, threshold=gait_threshold
     )
-    rew_feet_slide = env.cfg.rew_scale_feet_slide * compute_feet_slide(env)
+    
+    # Feet slide penalty (reference: weight=-0.3)
+    rew_feet_slide = getattr(env.cfg, "rew_scale_feet_slide", -0.3) * compute_feet_slide(env)
 
-    leg_lift_raw = compute_leg_lift(env, clearance=getattr(env.cfg, "desired_foot_clearance", 0.05))
-    rew_leg_lift = getattr(env.cfg, "rew_scale_leg_lift", 0.99) * leg_lift_raw
+    # Feet clearance reward (reference: weight=0.99, std=0.05, tanh_mult=2.0, target_height=0.05)
+    clearance_std = getattr(env.cfg, "feet_clearance_std", 0.05)
+    clearance_tanh_mult = getattr(env.cfg, "feet_clearance_tanh_mult", 2.0)
+    clearance_target = getattr(env.cfg, "desired_foot_clearance", 0.05)
+    rew_feet_clearance = getattr(env.cfg, "rew_scale_leg_lift", 0.99) * compute_foot_clearance_reward(
+        env, std=clearance_std, tanh_mult=clearance_tanh_mult, target_height=clearance_target
+    )
 
     # Feet contact forces penalty (reference: weight=-0.2, threshold=100)
     rew_feet_contact_forces = torch.zeros(env.scene.num_envs, device=env.device)
     sensors = getattr(env.scene, "sensors", {})
     left = sensors.get("contact_forces_left", None)
     right = sensors.get("contact_forces_right", None)
-    if left is not None and hasattr(left, "data") and left.data.net_forces_w is not None:
-        forces = left.data.net_forces_w
-        force_norm = torch.norm(forces, dim=-1)
-        threshold = getattr(env.cfg, "foot_contact_force_threshold", 100.0)
-        excess_forces = torch.clamp(force_norm - threshold, min=0.0)
-        rew_feet_contact_forces = rew_feet_contact_forces + torch.sum(excess_forces ** 2, dim=1)
-    if right is not None and hasattr(right, "data") and right.data.net_forces_w is not None:
-        forces = right.data.net_forces_w
-        force_norm = torch.norm(forces, dim=-1)
-        threshold = getattr(env.cfg, "foot_contact_force_threshold", 100.0)
-        excess_forces = torch.clamp(force_norm - threshold, min=0.0)
-        rew_feet_contact_forces = rew_feet_contact_forces + torch.sum(excess_forces ** 2, dim=1)
+    threshold = getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+    
+    for sensor in [left, right]:
+        if sensor is not None and hasattr(sensor, "data") and sensor.data.net_forces_w is not None:
+            forces = sensor.data.net_forces_w
+            force_norm = torch.norm(forces, dim=-1)
+            if force_norm.dim() > 1:
+                force_norm = force_norm.sum(dim=1)  # Sum over bodies
+            excess_forces = torch.clamp(force_norm - threshold, min=0.0)
+            rew_feet_contact_forces = rew_feet_contact_forces + excess_forces ** 2
+    
     rew_feet_contact_forces = getattr(env.cfg, "rew_scale_feet_contact_forces", -0.2) * rew_feet_contact_forces
-
-    # Leg lift velocity reward (encourage fast lifting)
-    rew_leg_lift_velocity = getattr(env.cfg, "rew_scale_leg_lift_velocity", 0.0) * compute_leg_lift_velocity(env)
-
-    # Penalty for both feet in contact (encourages alternating gait)
-    rew_both_feet_contact = getattr(env.cfg, "rew_scale_both_feet_contact", -5.0) * compute_both_feet_contact_penalty(
-        env, force_threshold=getattr(env.cfg, "foot_contact_force_threshold", 1.0)
-    )
-
-    # Ankle gravity projection penalty (ensures ankle links are vertical)
-    rew_ankle_gravity = getattr(env.cfg, "rew_scale_ankle_gravity", -2.0) * compute_ankle_gravity_projection_penalty(env)
 
     # 3) Stability penalties - Following reference configuration
     # Root pitch and roll penalty
@@ -670,24 +678,22 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_action_rate
         + rew_dof_pos_limits  # Reference: DOF position limits penalty
         + rew_joint_torques
-        + rew_feet_air_time
+        + rew_gait  # Reference: gait reward
         + rew_feet_slide
-        + rew_leg_lift
+        + rew_feet_clearance  # Reference: feet clearance reward
         + rew_feet_contact_forces  # Reference: feet contact forces penalty
         + rew_undesired_contacts
         + rew_joint_deviation_hip
         + rew_joint_deviation_knee
         + rew_forward_distance
-        + rew_both_feet_contact
-        + rew_ankle_gravity
         + rew_root_pitch_roll
         + rew_imbalance  # Very high penalty for imbalance (reset condition)
     )
 
     # Logging (two categories + progress)
     if env._tb_step % 32 == 0:
-        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_feet_air_time + rew_leg_lift + rew_leg_lift_velocity + rew_forward_distance)
-        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_both_feet_contact + rew_ankle_gravity)
+        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_forward_distance)
+        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces)
 
         # Get feet air time statistics for logging
         air_time_stats = get_feet_air_time_stats(env)
@@ -716,12 +722,7 @@ def compute_total_reward(env) -> torch.Tensor:
         env._tb_writer.add_scalar("balance/root_pitch_deg", torch.rad2deg(pitch).mean().item(), env._tb_step)
         env._tb_writer.add_scalar("balance/root_roll_deg", torch.rad2deg(roll).mean().item(), env._tb_step)
 
-    # curriculum update
-    cmd_error = base_lin_vel[:, :2] - env._command[:, :2]
-    cmd_error_mean = float(torch.norm(cmd_error, dim=1).mean().item())
-    gait_stats = compute_gait_rewards(env, root_state)
-    if env.curriculum.update(env._control_dt, gait_stats["height_mean"], gait_stats["single_rate"], cmd_error_mean):
-        env._sample_commands(None)
+    # No curriculum learning - commands are sampled at fixed intervals
 
     env._prev_actions = env.actions.clone()
     env._tb_step += 1
