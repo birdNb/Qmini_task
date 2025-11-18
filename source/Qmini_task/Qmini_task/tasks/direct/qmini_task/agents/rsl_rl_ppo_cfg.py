@@ -10,30 +10,31 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class QminiRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
+    # G1 style training configuration
+    num_steps_per_env = 48  # Steps per environment per rollout
     max_iterations = 30000
     save_interval = 1000
     experiment_name = "qmini_rough"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[512, 256, 128],
+        actor_hidden_dims=[512, 256, 128],  # G1 style: deep network for complex locomotion
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.005,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
+        clip_param=0.2,  # G1 style: standard PPO clip parameter
+        entropy_coef=0.01,  # G1 style: moderate exploration
+        num_learning_epochs=5,  # G1 style: multiple epochs for sample efficiency
+        num_mini_batches=8,  # steps=48 → batch=6
+        learning_rate=3.0e-4,  # G1 style: moderate learning rate for stable training
+        schedule="adaptive",  # Adaptive learning rate scheduling
+        gamma=0.99,  # G1 style: standard discount factor
+        lam=0.95,  # G1 style: GAE lambda
+        desired_kl=0.015,  # G1 style: target KL divergence for adaptive learning rate
+        max_grad_norm=1.0,  # Gradient clipping
     )
 
 

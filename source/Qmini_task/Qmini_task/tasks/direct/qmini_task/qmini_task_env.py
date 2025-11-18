@@ -151,6 +151,8 @@ class QminiTaskEnv(DirectRLEnv):
         # forward distance accumulators (initialized on first reset)
         self._prev_root_x = None
         self._cum_forward_x = None
+        # joint velocity for acceleration calculation
+        self._prev_joint_vel = None
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -557,6 +559,10 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._filtered_actions[env_ids] = 0.0
         self._prev_targets[env_ids] = joint_pos[:, self._controlled_joint_indices]
+        # Initialize joint velocity for acceleration calculation
+        if self._prev_joint_vel is None:
+            self._prev_joint_vel = torch.zeros((self.scene.num_envs, self._num_dofs), device=self.device)
+        self._prev_joint_vel[env_ids] = joint_vel[:, self._controlled_joint_indices]
 
     @staticmethod
     def _quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:

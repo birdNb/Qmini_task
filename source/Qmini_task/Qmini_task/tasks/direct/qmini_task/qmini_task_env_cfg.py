@@ -168,17 +168,17 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
 
 @configclass
 class QminiTaskEnvCfg(DirectRLEnvCfg):
-    # env
-    decimation = 2
-    episode_length_s = 10.0
+    # env - Following reference configuration
+    decimation = 4  # Reference: 4 (increased from 2)
+    episode_length_s = 20.0  # Reference: 20.0 (increased from 10.0)
     # - spaces definition
     action_space = 10
     observation_space = 42  # Updated to 42 dimensions
     state_space = 0
 
-    # simulation
+    # simulation - Following reference configuration
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 120,
+        dt=0.005,  # Reference: 0.005 (changed from 1/120 ≈ 0.0083)
         render_interval=decimation,
         physics_prim_path="/physicsScene",
         gravity=(0.0, 0.0, -9.81),
@@ -190,10 +190,10 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # terrain
     terrain_cfg: TerrainGeneratorCfg = ROUGH_TERRAINS_CFG
 
-    # scene
+    # scene - Following reference configuration
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256,
-        env_spacing=1.0,
+        num_envs=512,  # Reference: 4096, using 512 for reasonable training speed
+        env_spacing=2.5,  # Reference: 2.5 (保持分散生成)
         replicate_physics=True,
     )
 
@@ -250,48 +250,62 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "RL_joint5": 0.0,
     }
 
-    # reward scales - Gait Training Rewards (following reference implementation)
-    # 1. Task Rewards
-    rew_scale_track_lin_vel_xy = 2.5      # stronger speed tracking 
-    
-    rew_scale_track_ang_vel_z = 0.5      # track_ang_vel_z_exp: weight=0.5
+    # reward scales - Following reference configuration
+    # 1. Task Rewards - Reference weights
+    rew_scale_track_lin_vel_xy = 3.0      # Reference: 3.0 (track_lin_vel_xy_yaw_frame_exp)
+    rew_scale_lin_vel_z = -2.0            # Reference: -2.0 (base_linear_velocity)
+    rew_scale_track_ang_vel_z = 3.0       # Reference: 3.0 (track_ang_vel_z_exp)
+    rew_scale_alive = 0.3                 # Reference: 0.3 (alive reward)
 
-    # 2. Gait Rewards
-    rew_scale_feet_air_time = 8.0        # 提高“腾空时间”奖励权重
-    rew_scale_feet_slide = -0.1          # 初期放松滑动惩罚
-    rew_scale_leg_lift = 2.0             # 抬腿高度奖励更强
+    # 2. Base Stability Penalties - Reference weights
+    rew_scale_ang_vel_xy = -0.5           # Reference: -0.5 (base_angular_velocity)
+    rew_scale_flat_orientation = -1.0     # Reference: -1.0 (flat_orientation_l2)
+    rew_scale_base_height = -10.0         # Reference: -10.0 (base_height_l2, target_height: 0.15)
+    rew_scale_root_pitch_roll = -1.0     # Combined with flat_orientation
 
-    # 3. Stability Penalties
-    rew_scale_lin_vel_z = -1.0          # 先松后紧
-    rew_scale_ang_vel_xy = -0.02        # 先松后紧
-    rew_scale_flat_orientation = -0.25   # 先松后紧
+    # 3. Action Penalties - Reference weights
+    rew_scale_joint_acc = -2.5e-7         # Reference: -2.5e-7 (joint_acc_l2)
+    rew_scale_action_rate = -0.10         # Reference: -0.10 (action_rate_l2)
+    rew_scale_joint_torques = -1.0e-5     # Keep existing
+    rew_scale_dof_pos_limits = -5.0       # Reference: -5.0 (dof_pos_limits)
 
-    # 4. Action Penalties
-    rew_scale_joint_torques = -1.0e-5    # joint_torques_l2: weight=-1e-5 (惩罚力矩)
-    rew_scale_action_rate = -0.005      # 初期放松，便于探索
+    # 4. Gait Rewards - Reference weights
+    rew_scale_feet_air_time = 0.5         # Reference: 0.5 (gait, period: 0.6)
+    rew_scale_feet_slide = -0.3            # Reference: -0.3 (feet_slide)
+    rew_scale_leg_lift = 0.99              # Reference: 0.99 (feet_clearance, target_height: 0.05)
+    rew_scale_leg_lift_velocity = 0.0     # Not in reference
+    rew_scale_both_feet_contact = 0.0     # Not in reference
+    rew_scale_feet_contact_forces = -0.2  # Reference: -0.2 (feet_contact_forces, threshold: 100)
 
-    # 5. Contact Penalties
-    rew_scale_undesired_contacts = -1.0  # undesired_contacts: weight=-1.0 (惩罚不当接触)
-    rew_scale_joint_deviation_hip = -0.1  # joint_deviation_hip: weight=-0.1 (惩罚髋关节偏离)
-    rew_scale_joint_deviation_knee = -0.01  # joint_deviation_knee: weight=-0.01 (惩罚膝关节偏离)
+    # 5. Contact Penalties - Reference weights
+    rew_scale_undesired_contacts = -1.0   # Reference: -1.0 (undesired_contacts)
+    rew_scale_joint_deviation_hip = -0.5  # Reference: -0.5 (joint_deviation_hips)
+    rew_scale_joint_deviation_knee = 0.0  # Not in reference
+    rew_scale_ankle_gravity = 0.0         # Not in reference
 
-    # success / failure thresholds
+    # success / failure thresholds - Following reference configuration
     success_joint_tol = 0.05
     success_upright_cos = 0.98
     success_pitch_tol = math.radians(5.0)
     failure_pitch_angle = math.radians(45.0)
-    failure_min_height = 0.25  # [m] 低于该高度重置
+    failure_min_height = 0.10  # Reference: 0.10 (base_height termination)
+    imbalance_pitch_threshold = math.radians(30.0)  # [rad] 失衡惩罚阈值（pitch角度）
+    imbalance_roll_threshold = math.radians(30.0)    # [rad] 失衡惩罚阈值（roll角度）
+    imbalance_height_threshold = 0.15  # Reference: 0.15 (base_height target)
 
     # reset sampling
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
 
-    desired_root_height = 0.35       # 目标机身高度 [m]
-    foot_contact_force_threshold = 1.0  # 足底接触判定阈值 [N]
-    desired_foot_clearance = 0.07   # 摆动腿目标离地高度 [m]
+    desired_root_height = 0.15       # Reference: 0.15 (base_height target)
+    foot_contact_force_threshold = 100.0  # Reference: 100 (feet_contact_forces threshold)
+    desired_foot_clearance = 0.05    # Reference: 0.05 (feet_clearance target_height)
+    leg_lift_exploration_threshold = 0.02  # 抬腿探索奖励阈值 [m]
+    single_support_height_diff = 0.03  # 单腿支撑判断：高度差阈值 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
-    rew_scale_forward_distance = 20.0    # 累积前向距离高额奖励（起步强）
+    rew_scale_forward_distance = 0.5     # 累积前向距离奖励（G1 style: lower priority than velocity tracking）
+    rew_scale_imbalance_penalty = -50.0   # 机身失衡高额惩罚（接近reset条件时）
     # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
     joint_velocity_limits = (
         1.0,   # LL_joint1
@@ -306,14 +320,32 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         1.0,   # RL_joint5
     )
 
-    # command profile
-    command_lin_vel_x_range = (0.3, 0.8)
-    command_lin_vel_y_range = (0.0, 0.0)
-    command_yaw_range = (0.0, 0.0)
-    command_change_interval_s = 2.0
+    # command profile - Following reference configuration
+    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: (-0.5, 0.5)
+    command_lin_vel_y_range = (-0.2, 0.2)  # Reference: (-0.2, 0.2)
+    command_yaw_range = (-0.1, 0.1)  # Reference: ang_vel_z (-0.1, 0.1)
+    command_change_interval_s = 10.0  # Reference: resampling_time_range (10.0, 10.0)
 
-    # gait parameters
-    gait_cycle_duration = 0.8
+    # Curriculum learning configuration (G1 style: multi-phase training)
+    curriculum_enabled = True
+    curriculum_lin_vel_x_schedule = (
+        (0.0, 0.0),      # Phase 0: Standing (no forward motion)
+        (0.0, 0.3),      # Phase 1: Slow walking
+        (0.2, 0.5),      # Phase 2: Medium walking
+        (0.3, 0.8),      # Phase 3: Fast walking (final target)
+    )
+    curriculum_phase_durations = (
+        300.0,  # Phase 0: 300s standing
+        600.0,  # Phase 1: 600s slow walking
+        1200.0, # Phase 2: 1200s medium walking
+        # Phase 3: continue indefinitely
+    )
+    curriculum_height_threshold = 0.32  # Minimum height to advance phase
+    curriculum_single_leg_threshold = 0.15  # Minimum single leg support rate
+    curriculum_cmd_error_threshold = 0.5  # Maximum velocity tracking error
+
+    # gait parameters - Following reference configuration
+    gait_cycle_duration = 0.6  # Reference: period=0.6 (gait reward)
     gait_hip_amp = 0.35
     gait_knee_base = -0.6
     gait_knee_amp = 0.35
@@ -355,8 +387,8 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
                 restitution_combine_mode="multiply",
-                static_friction=2.0,  # 增大摩擦力
-                dynamic_friction=2.0,  # 增大摩擦力
+                static_friction=1.0,  # Reference: 1.0
+                dynamic_friction=1.0,  # Reference: 1.0
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.2, 0.4, 0.2),  # Gray color for terrain
