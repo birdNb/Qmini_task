@@ -13,7 +13,7 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
-from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.terrains import TerrainImporterCfg
@@ -42,80 +42,31 @@ QMINI_ROBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.45),
+        pos=(0.0, 0.0, 0.35),  # Reference: pos=(0.0, 0.0, 0.3)
         joint_pos={
-            "LL_joint1": 0.0,
-            "LL_joint2": 0.0,
-            "LL_joint3": 0.0,
-            "LL_joint4": 0.0,
-            "LL_joint5": 0.0,
-            "RL_joint1": 0.0,
-            "RL_joint2": 0.0,
-            "RL_joint3": 0.0,
-            "RL_joint4": 0.0,
-            "RL_joint5": 0.0,
+            "LL_joint1": 0.0,   # hip_yaw
+            "LL_joint2": 0.0,   # hip_roll
+            "LL_joint3": 0.3,   # hip_pitch (Reference: 0.3)
+            "LL_joint4": -0.8,  # knee (Reference: -0.8)
+            "LL_joint5": 0.5,   # ankle (Reference: 0.5)
+            "RL_joint1": 0.0,   # hip_yaw
+            "RL_joint2": 0.0,   # hip_roll
+            "RL_joint3": 0.3,   # hip_pitch (Reference: 0.3)
+            "RL_joint4": -0.8,  # knee (Reference: -0.8)
+            "RL_joint5": 0.5,   # ankle (Reference: 0.5)
         },
     ),
     actuators={
-        "LL_hip_yaw": ImplicitActuatorCfg(
-            joint_names_expr=["LL_joint1"],
-            effort_limit_sim=20.0,
-            stiffness=40.0,
-            damping=6.0,
-        ),
-        "LL_hip_roll": ImplicitActuatorCfg(
-            joint_names_expr=["LL_joint2"],
-            effort_limit_sim=60.0,
-            stiffness=50.0,
-            damping=6.0,
-        ),
-        "LL_hip_pitch": ImplicitActuatorCfg(
-            joint_names_expr=["LL_joint3"],
-            effort_limit_sim=20.0,
-            stiffness=60.0,
-            damping=8.0,
-        ),
-        "LL_knee": ImplicitActuatorCfg(
-            joint_names_expr=["LL_joint4"],
-            effort_limit_sim=20.0,
-            stiffness=70.0,
-            damping=10.0,
-        ),
-        "LL_ankle": ImplicitActuatorCfg(
-            joint_names_expr=["LL_joint5"],
-            effort_limit_sim=20.0,
-            stiffness=35.0,
-            damping=6.0,
-        ),
-        "RL_hip_yaw": ImplicitActuatorCfg(
-            joint_names_expr=["RL_joint1"],
-            effort_limit_sim=20.0,
-            stiffness=40.0,
-            damping=6.0,
-        ),
-        "RL_hip_roll": ImplicitActuatorCfg(
-            joint_names_expr=["RL_joint2"],
-            effort_limit_sim=60.0,
-            stiffness=50.0,
-            damping=6.0,
-        ),
-        "RL_hip_pitch": ImplicitActuatorCfg(
-            joint_names_expr=["RL_joint3"],
-            effort_limit_sim=20.0,
-            stiffness=60.0,
-            damping=8.0,
-        ),
-        "RL_knee": ImplicitActuatorCfg(
-            joint_names_expr=["RL_joint4"],
-            effort_limit_sim=20.0,
-            stiffness=70.0,
-            damping=10.0,
-        ),
-        "RL_ankle": ImplicitActuatorCfg(
-            joint_names_expr=["RL_joint5"],
-            effort_limit_sim=20.0,
-            stiffness=35.0,
-            damping=6.0,
+        # Reference: Unified actuator config for all joints
+        # effort_limit_sim=10, velocity_limit_sim=30.0, stiffness=40.0, damping=1.0, armature=0.01
+        # Using slightly higher effort_limit for better performance while keeping other params similar
+        "N5020-16": ImplicitActuatorCfg(
+            joint_names_expr=[".*L_joint.*"],  # All joints (LL and RL)
+            effort_limit_sim=25.0,  # Reference: 10, increased for better torque
+            velocity_limit_sim=30.0,  # Reference: 30.0
+            stiffness=40.0,  # Reference: 40.0
+            damping=1.0,  # Reference: 1.0
+            armature=0.01,  # Reference: 0.01
         ),
     },
 )
@@ -144,7 +95,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0  # Reference: 20.0 (increased from 10.0)
     # - spaces definition
     action_space = 10
-    observation_space = 43  # Reference: 3+3+3+3+10+10+10+1 = 43 (added gait_phase)
+    observation_space = 40  # Reference: 3+3+3+10+10+10+1 = 40 (base_ang_vel, projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel, last_action, gait_phase)
     state_space = 0
 
     # simulation - Following reference configuration
@@ -221,30 +172,35 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "RL_joint5": 0.0,
     }
 
-    # reward scales - Following reference configuration
-    # 1. Task Rewards - Reference weights
-    rew_scale_track_lin_vel_xy = 3.0      # Reference: 3.0 (track_lin_vel_xy_yaw_frame_exp)
-    rew_scale_lin_vel_z = -2.0            # Reference: -2.0 (base_linear_velocity)
-    rew_scale_track_ang_vel_z = 3.0       # Reference: 3.0 (track_ang_vel_z_exp)
-    rew_scale_alive = 0.3                 # Reference: 0.3 (alive reward)
+    # reward scales - Adjusted to prevent jumping and ensure reasonable reward values
+    # 1. Task Rewards - Reduced to prevent jumping behavior
+    rew_scale_track_lin_vel_xy = 1.5      # Reduced from 3.0 to prevent jumping for speed
+    rew_scale_lin_vel_z = -1.0            # Reduced from -2.0
+    rew_scale_track_ang_vel_z = 1.5       # Reduced from 3.0
+    rew_scale_alive = 0.5                 # Increased from 0.3 to encourage survival
+    rew_scale_reset_penalty = -1.0        # Reduced from -10.0 to prevent excessive penalty
+    rew_scale_stationary_penalty = -5.0   # High penalty for stationary root (no movement)
+    stationary_velocity_threshold = 0.05  # Velocity threshold below which robot is considered stationary [m/s]
 
-    # 2. Base Stability Penalties - Reference weights
-    rew_scale_ang_vel_xy = -0.5           # Reference: -0.5 (base_angular_velocity)
-    rew_scale_flat_orientation = -1.0     # Reference: -1.0 (flat_orientation_l2)
-    rew_scale_base_height = -10.0         # Reference: -10.0 (base_height_l2, target_height: 0.15)
-    rew_scale_root_pitch_roll = -1.0     # Combined with flat_orientation
+    # 2. Base Stability Penalties - Reduced to reasonable values
+    rew_scale_ang_vel_xy = -0.3            # Reduced from -0.5
+    rew_scale_flat_orientation = -0.5     # Reduced from -1.0
+    rew_scale_base_height = -8.0          # Increased to encourage standing (target: 0.40m)
+    rew_scale_base_height_reward = 2.0     # Positive reward when close to target height
+    base_height_reward_tolerance = 0.05    # 5cm tolerance for height reward
+    rew_scale_root_pitch_roll = -0.5      # Reduced from -1.0
 
-    # 3. Action Penalties - Reference weights
-    rew_scale_joint_acc = -2.5e-7         # Reference: -2.5e-7 (joint_acc_l2)
-    rew_scale_action_rate = -0.10         # Reference: -0.10 (action_rate_l2)
+    # 3. Action Penalties - Keep reasonable
+    rew_scale_joint_acc = -2.5e-7         # Keep as is
+    rew_scale_action_rate = -0.05         # Reduced from -0.10
     rew_scale_joint_torques = -1.0e-5     # Keep existing
-    rew_scale_dof_pos_limits = -5.0       # Reference: -5.0 (dof_pos_limits)
+    rew_scale_dof_pos_limits = -2.0       # Reduced from -5.0
 
-    # 4. Gait Rewards - Reference weights
-    rew_scale_feet_air_time = 0.5         # Reference: 0.5 (gait, period: 0.6)
-    rew_scale_feet_slide = -0.3            # Reference: -0.3 (feet_slide)
-    rew_scale_leg_lift = 0.99              # Reference: 0.99 (feet_clearance, target_height: 0.05)
-    rew_scale_feet_contact_forces = -0.2  # Reference: -0.2 (feet_contact_forces, threshold: 100)
+    # 4. Gait Rewards - Reduced to prevent jumping
+    rew_scale_feet_air_time = 0.3         # Reduced from 0.5
+    rew_scale_feet_slide = -0.2            # Reduced from -0.3
+    rew_scale_leg_lift = 0.3              # Reduced from 0.99 to prevent excessive leg lifting
+    rew_scale_feet_contact_forces = -0.01  # Reduced from -0.2 to prevent excessive penalty
 
     # Gait parameters for compute_feet_gait
     gait_offset = [0.0, 0.5]              # Reference: offset=[0.0, 0.5]
@@ -252,9 +208,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     feet_clearance_std = 0.05              # Reference: std=0.05
     feet_clearance_tanh_mult = 2.0        # Reference: tanh_mult=2.0
 
-    # 5. Contact Penalties - Reference weights
-    rew_scale_undesired_contacts = -1.0   # Reference: -1.0 (undesired_contacts)
-    rew_scale_joint_deviation_hip = -0.5  # Reference: -0.5 (joint_deviation_hips)
+    # 5. Contact Penalties - Reduced to reasonable values
+    rew_scale_undesired_contacts = -0.5   # Reduced from -1.0
+    rew_scale_joint_deviation_hip = -0.2  # Reduced from -0.5
     rew_scale_joint_deviation_knee = 0.0  # Not in reference
     rew_scale_ankle_gravity = 0.0         # Not in reference
 
@@ -263,7 +219,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     success_upright_cos = 0.98
     success_pitch_tol = math.radians(5.0)
     failure_pitch_angle = math.radians(45.0)
-    failure_min_height = 0.25  # Reset when root height below 0.3m
+    # 增加重置高度阈值
+    failure_min_height = 0.30  # Reset when root height below 0.25m
+
     imbalance_pitch_threshold = math.radians(30.0)  # [rad] 失衡惩罚阈值（pitch角度）
     imbalance_roll_threshold = math.radians(30.0)    # [rad] 失衡惩罚阈值（roll角度）
     imbalance_height_threshold = 0.15  # Reference: 0.15 (base_height target)
@@ -272,15 +230,14 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
 
-    desired_root_height = 0.35       # Base height target: 0.35m
+    desired_root_height = 0.4       # Base height target: 0.35m
     foot_contact_force_threshold = 100.0  # Reference: 100 (feet_contact_forces threshold)
     desired_foot_clearance = 0.05    # Reference: 0.05 (feet_clearance target_height)
     leg_lift_exploration_threshold = 0.02  # 抬腿探索奖励阈值 [m]
     single_support_height_diff = 0.03  # 单腿支撑判断：高度差阈值 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
-    rew_scale_forward_distance = 0.5     # 累积前向距离奖励（G1 style: lower priority than velocity tracking）
-    rew_scale_imbalance_penalty = -50.0   # 机身失衡高额惩罚（接近reset条件时）
+    rew_scale_imbalance_penalty = -2.0   # Reduced from -50.0 to prevent excessive penalty
     # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
     joint_velocity_limits = (
         1.0,   # LL_joint1
@@ -295,10 +252,10 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         1.0,   # RL_joint5
     )
 
-    # command profile - Following reference configuration (no curriculum)
-    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: ranges.lin_vel_x=(-0.5, 0.5)
-    command_lin_vel_y_range = (-0.2, 0.2)  # Reference: ranges.lin_vel_y=(-0.2, 0.2)
-    command_yaw_range = (-0.1, 0.1)  # Reference: ranges.ang_vel_z=(-0.1, 0.1)
+    # command profile - Following reference configuration
+    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: ranges.lin_vel_x=(-0.5, 0.5) - allow forward/backward
+    command_lin_vel_y_range = (-0.2, 0.2)  # Reference: ranges.lin_vel_y=(-0.2, 0.2) - allow lateral movement
+    command_yaw_range = (-0.1, 0.1)  # Reference: ranges.ang_vel_z=(-0.1, 0.1) - allow rotation
     command_change_interval_s = 10.0  # Reference: resampling_time_range=(10.0, 10.0)
 
     # gait parameters - Following reference configuration
@@ -315,7 +272,15 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     max_joint_velocity = 8.0  # [rad/s]
     action_filter_gain = 0.2
 
-    # sensors - register separate contact sensors for both ankles
+    # sensors - register height scanner and contact sensors
+    height_scanner: RayCasterCfg = RayCasterCfg(
+        prim_path="/World/envs/env_.*/Qmini/Qmini/base_link",  # Qmini使用base_link作为基座
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),  # 高度扫描偏移
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),  # 较小的扫描范围
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
     contact_forces_left: ContactSensorCfg = ContactSensorCfg(
         prim_path="/World/envs/env_.*/Qmini/Qmini/LL_ankle",
         update_period=0.0,
@@ -354,3 +319,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
             ),
             debug_vis=False,  # 显示地形坐标系（关闭）
         )
+        # Update sensor update periods (following reference configuration)
+        # Height scanner updates at decimation rate (every 4 steps)
+        if hasattr(self, "height_scanner"):
+            self.height_scanner.update_period = self.decimation * self.sim.dt

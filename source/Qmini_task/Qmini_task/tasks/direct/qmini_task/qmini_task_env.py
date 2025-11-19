@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.utils.math as math_utils
 
@@ -144,9 +144,6 @@ class QminiTaskEnv(DirectRLEnv):
         self._setup_visual_markers()
         self._visualize_markers()
 
-        # forward distance accumulators (initialized on first reset)
-        self._prev_root_x = None
-        self._cum_forward_x = None
         # joint velocity for acceleration calculation
         self._prev_joint_vel = None
 
@@ -160,9 +157,11 @@ class QminiTaskEnv(DirectRLEnv):
         self.scene.articulations["robot"] = self.robot
         light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.6, 0.6, 0.6))
         light_cfg.func("/World/Light", light_cfg)
-        # Register contact sensors following tutorial style:
-        # - expose a combined key "contact_forces" (use left as primary to match example access)
-        # - also register right ankle separately if provided
+        # Register sensors
+        # Height scanner for terrain height detection
+        if hasattr(self.cfg, "height_scanner"):
+            self.scene.sensors["height_scanner"] = RayCaster(self.cfg.height_scanner)
+        # Contact sensors for both ankles
         self.scene.sensors["contact_forces_left"] = ContactSensor(self.cfg.contact_forces_left)
         self.scene.sensors["contact_forces_right"] = ContactSensor(self.cfg.contact_forces_right)
 
@@ -414,18 +413,15 @@ class QminiTaskEnv(DirectRLEnv):
         """
         root_state = self.robot.data.root_state_w
         base_quat = root_state[:, 3:7]  # [w, x, y, z]
-        base_lin_vel = root_state[:, 7:10]  # [vx, vy, vz]
+        # NOTE: base_lin_vel is NOT in Policy observations (only in Critic)
         base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
 
-        # 1. base_lin_vel (3 dims) - with noise ±0.1
-        base_lin_vel_noise = torch.rand_like(base_lin_vel) * 0.2 - 0.1
-        obs_base_lin_vel = base_lin_vel + base_lin_vel_noise
-
-        # 2. base_ang_vel (3 dims) - Reference: scale=0.2, noise=(-0.2, 0.2)
+        # 1. base_ang_vel (3 dims) - Reference: scale=0.2, noise=(-0.2, 0.2)
+        # NOTE: Policy observation does NOT include base_lin_vel (only Critic has it)
         base_ang_vel_noise = torch.rand_like(base_ang_vel) * 0.4 - 0.2
         obs_base_ang_vel = base_ang_vel * 0.2 + base_ang_vel_noise  # Reference: scale=0.2
 
-        # 3. projected_gravity (3 dims) - Reference: noise=(-0.05, 0.05)
+        # 2. projected_gravity (3 dims) - Reference: noise=(-0.05, 0.05)
         # Gravity in world frame: [0, 0, -1] (normalized)
         gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
         # Rotate gravity to base frame using quaternion
@@ -433,38 +429,38 @@ class QminiTaskEnv(DirectRLEnv):
         projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05  # Reference: noise=(-0.05, 0.05)
         obs_projected_gravity = projected_gravity + projected_gravity_noise
 
-        # 4. velocity_commands (3 dims) - [target_vx, target_vy, target_ωz]
+        # 3. velocity_commands (3 dims) - [target_vx, target_vy, target_ωz]
         # Convert command from [vx, vy, yaw] to [vx, vy, ωz]
         velocity_commands = torch.zeros((self.scene.num_envs, 3), device=self.device)
         velocity_commands[:, 0] = self._command[:, 0]  # vx
         velocity_commands[:, 1] = self._command[:, 1]  # vy
         velocity_commands[:, 2] = self._command[:, 2]  # yaw (used as ωz)
 
-        # 5. joint_pos_rel (10 dims) - Reference: noise=(-0.01, 0.01)
+        # 4. joint_pos_rel (10 dims) - Reference: noise=(-0.01, 0.01)
         all_joint_pos = self.joint_pos[:, self._controlled_joint_indices]
         all_joint_pos_rel = all_joint_pos - self._target_pos.unsqueeze(0)
         joint_pos_noise = torch.rand_like(all_joint_pos_rel) * 0.02 - 0.01  # Reference: noise=(-0.01, 0.01)
         obs_joint_pos_rel = all_joint_pos_rel + joint_pos_noise
 
-        # 6. joint_vel_rel (10 dims) - Reference: scale=0.05, noise=(-1.5, 1.5)
+        # 5. joint_vel_rel (10 dims) - Reference: scale=0.05, noise=(-1.5, 1.5)
         joint_vel = self.joint_vel[:, self._controlled_joint_indices]
         joint_vel_noise = torch.rand_like(joint_vel) * 3.0 - 1.5  # Reference: noise=(-1.5, 1.5)
         obs_joint_vel = joint_vel * 0.05 + joint_vel_noise  # Reference: scale=0.05
 
-        # 7. last_action (10 dims) - Reference: last_action
+        # 6. last_action (10 dims) - Reference: last_action
         obs_actions = self._prev_actions
 
-        # 8. gait_phase (1 dim) - Reference: gait_phase, period=0.6
+        # 7. gait_phase (1 dim) - Reference: gait_phase, period=0.6
         gait_phase_normalized = (self._gait_phase / (2.0 * math.pi)) % 1.0  # Normalize to [0, 1)
         obs_gait_phase = gait_phase_normalized.unsqueeze(1)  # [N, 1]
 
-        # Concatenate all observations: 3+3+3+3+10+10+10+1 = 43 dims (updated from 42)
+        # Concatenate all observations: 3+3+3+10+10+10+1 = 40 dims (Reference: no base_lin_vel in Policy)
+        # Order matches reference: base_ang_vel, projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel, last_action, gait_phase
         obs = torch.cat(
             (
-                obs_base_lin_vel,      # 3
-                obs_base_ang_vel,       # 3
-                obs_projected_gravity,  # 3
-                velocity_commands,      # 3
+                obs_base_ang_vel,       # 3 (Reference: base_ang_vel)
+                obs_projected_gravity,  # 3 (Reference: projected_gravity)
+                velocity_commands,      # 3 (Reference: velocity_commands)
                 obs_joint_pos_rel,      # 10 (Reference: joint_pos_rel)
                 obs_joint_vel,          # 10 (Reference: joint_vel_rel)
                 obs_actions,            # 10 (Reference: last_action)
@@ -518,6 +514,20 @@ class QminiTaskEnv(DirectRLEnv):
         position_noise = (torch.rand(len(env_ids), 3, device=default_root_state.device) - 0.5) * 2.0 * position_noise_scale
         position_noise[:, 2] = 0.0  # Don't add noise to Z (height)
         default_root_state[:, :3] += self.scene.env_origins[env_ids] + position_noise
+
+        # Ensure base height is high enough to prevent ground penetration
+        # With joint positions (hip_pitch=0.3, knee=-0.8, ankle=0.5),
+        # we need sufficient clearance. Increase base height to prevent penetration.
+        base_height_offset = 0.15  # Additional safety margin to prevent ground penetration
+        # Get initial height from robot config or use default (0.35m from QMINI_ROBOT_CFG)
+        initial_height = getattr(self.robot.cfg.init_state, "pos", (0.0, 0.0, 0.35))[2]
+        min_base_height = initial_height + base_height_offset  # 0.35 + 0.15 = 0.5m
+        default_root_state[:, 2] = torch.maximum(
+            default_root_state[:, 2],
+            torch.full((len(env_ids),), min_base_height, device=default_root_state.device)
+        )
+
+        # Ensure all velocities are zero to prevent bouncing
         default_root_state[:, 7:] = 0.0
 
         if self._orientation_noise > 0.0:
@@ -534,13 +544,6 @@ class QminiTaskEnv(DirectRLEnv):
 
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel
-
-        # initialize forward accumulators if needed, and reset for these envs
-        if self._prev_root_x is None or self._cum_forward_x is None:
-            self._prev_root_x = torch.zeros(self.scene.num_envs, device=self.device)
-            self._cum_forward_x = torch.zeros(self.scene.num_envs, device=self.device)
-        self._prev_root_x[env_ids] = default_root_state[:, 0]
-        self._cum_forward_x[env_ids] = 0.0
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)

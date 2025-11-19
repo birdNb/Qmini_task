@@ -537,8 +537,21 @@ def compute_total_reward(env) -> torch.Tensor:
     ang_vel_error_z = base_ang_vel[:, 2] - cmd_ang_vel_z
     rew_track_ang_vel_z = getattr(env.cfg, "rew_scale_track_ang_vel_z", 3.0) * torch.exp(-ang_vel_error_z ** 2 / 0.25)
 
-    # Alive reward (reference: weight=0.3)
-    rew_alive = getattr(env.cfg, "rew_scale_alive", 0.3) * torch.ones(env.scene.num_envs, device=env.device)
+    # Alive reward (increased to encourage survival)
+    rew_alive = getattr(env.cfg, "rew_scale_alive", 2.0) * torch.ones(env.scene.num_envs, device=env.device)
+    
+    # Reset penalty (high penalty when robot is about to reset/terminate)
+    reset_penalty_scale = getattr(env.cfg, "rew_scale_reset_penalty", -100.0)
+    # Check if robot is about to reset (height too low)
+    min_height = getattr(env.cfg, "failure_min_height", 0.25)
+    is_resetting = (base_height < min_height).float()
+    rew_reset_penalty = reset_penalty_scale * is_resetting
+
+    # Penalty for stationary root (no velocity) - High penalty to encourage movement
+    base_lin_vel_xy_norm = torch.norm(base_lin_vel[:, :2], dim=1)
+    stationary_threshold = getattr(env.cfg, "stationary_velocity_threshold", 0.05)  # 0.05 m/s threshold
+    is_stationary = (base_lin_vel_xy_norm < stationary_threshold).float()
+    rew_stationary_penalty = getattr(env.cfg, "rew_scale_stationary_penalty", -5.0) * is_stationary
 
     # 2) Gait rewards - Following reference configuration
     # Gait reward (reference: weight=0.5, period=0.6, offset=[0.0, 0.5], threshold=0.55)
@@ -552,15 +565,15 @@ def compute_total_reward(env) -> torch.Tensor:
     # Feet slide penalty (reference: weight=-0.3)
     rew_feet_slide = getattr(env.cfg, "rew_scale_feet_slide", -0.3) * compute_feet_slide(env)
 
-    # Feet clearance reward (reference: weight=0.99, std=0.05, tanh_mult=2.0, target_height=0.05)
+    # Feet clearance reward - Reduced weight to prevent excessive leg lifting
     clearance_std = getattr(env.cfg, "feet_clearance_std", 0.05)
     clearance_tanh_mult = getattr(env.cfg, "feet_clearance_tanh_mult", 2.0)
     clearance_target = getattr(env.cfg, "desired_foot_clearance", 0.05)
-    rew_feet_clearance = getattr(env.cfg, "rew_scale_leg_lift", 0.99) * compute_foot_clearance_reward(
+    rew_feet_clearance = getattr(env.cfg, "rew_scale_leg_lift", 0.3) * compute_foot_clearance_reward(
         env, std=clearance_std, tanh_mult=clearance_tanh_mult, target_height=clearance_target
     )
 
-    # Feet contact forces penalty (reference: weight=-0.2, threshold=100)
+    # Feet contact forces penalty - Use linear penalty instead of squared to prevent excessive values
     rew_feet_contact_forces = torch.zeros(env.scene.num_envs, device=env.device)
     sensors = getattr(env.scene, "sensors", {})
     left = sensors.get("contact_forces_left", None)
@@ -573,10 +586,11 @@ def compute_total_reward(env) -> torch.Tensor:
             force_norm = torch.norm(forces, dim=-1)
             if force_norm.dim() > 1:
                 force_norm = force_norm.sum(dim=1)  # Sum over bodies
+            # Use linear penalty instead of squared to prevent excessive values
             excess_forces = torch.clamp(force_norm - threshold, min=0.0)
-            rew_feet_contact_forces = rew_feet_contact_forces + excess_forces ** 2
+            rew_feet_contact_forces = rew_feet_contact_forces + excess_forces
     
-    rew_feet_contact_forces = getattr(env.cfg, "rew_scale_feet_contact_forces", -0.2) * rew_feet_contact_forces
+    rew_feet_contact_forces = getattr(env.cfg, "rew_scale_feet_contact_forces", -0.01) * rew_feet_contact_forces
 
     # 3) Stability penalties - Following reference configuration
     # Root pitch and roll penalty
@@ -592,10 +606,16 @@ def compute_total_reward(env) -> torch.Tensor:
     gravity_error = projected_gravity - gravity_world
     rew_flat_orientation = getattr(env.cfg, "rew_scale_flat_orientation", -1.0) * torch.sum(gravity_error ** 2, dim=1)
 
-    # Base height penalty (reference: weight=-10.0, target_height=0.35)
+    # Base height penalty and reward (encourage standing at target height)
     target_height = getattr(env.cfg, "desired_root_height", 0.35)
     height_error = base_height - target_height
-    rew_base_height = getattr(env.cfg, "rew_scale_base_height", -10.0) * height_error ** 2
+    # Penalty for deviation from target (quadratic)
+    rew_base_height_penalty = getattr(env.cfg, "rew_scale_base_height", -8.0) * height_error ** 2
+    # Positive reward when close to target height (encourage standing)
+    height_reward_scale = getattr(env.cfg, "rew_scale_base_height_reward", 2.0)
+    height_tolerance = getattr(env.cfg, "base_height_reward_tolerance", 0.05)  # 5cm tolerance
+    height_reward = height_reward_scale * torch.exp(-(height_error ** 2) / (2 * height_tolerance ** 2))
+    rew_base_height = rew_base_height_penalty + height_reward
 
     # 4) Action penalties - Following reference configuration
     joint_torques = env.robot.data.applied_torque[:, env._controlled_joint_indices]
@@ -659,17 +679,10 @@ def compute_total_reward(env) -> torch.Tensor:
     else:
         rew_joint_deviation_knee = torch.zeros(env.scene.num_envs, device=env.device)
 
-    # Forward distance progress
-    root_x = env.robot.data.root_pos_w[:, 0]
-    delta_x = torch.clamp(root_x - env._prev_root_x, min=0.0)
-    env._cum_forward_x = env._cum_forward_x + delta_x
-    env._prev_root_x = root_x
-    rew_forward_distance = getattr(env.cfg, "rew_scale_forward_distance", 0.0) * env._cum_forward_x
-
     total_reward = (
         rew_track_lin_vel_xy  # Reference: velocity tracking
         + rew_track_ang_vel_z
-        + rew_alive  # Reference: alive reward
+        + rew_alive  # Increased alive reward to encourage survival
         + rew_lin_vel_z  # Penalize vertical motion
         + rew_ang_vel_xy
         + rew_flat_orientation
@@ -685,15 +698,16 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_undesired_contacts
         + rew_joint_deviation_hip
         + rew_joint_deviation_knee
-        + rew_forward_distance
         + rew_root_pitch_roll
         + rew_imbalance  # Very high penalty for imbalance (reset condition)
+        + rew_reset_penalty  # High penalty when resetting/terminating
+        + rew_stationary_penalty  # High penalty for stationary root (no movement)
     )
 
     # Logging (two categories + progress)
     if env._tb_step % 32 == 0:
-        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_forward_distance)
-        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces)
+        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance)
+        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_reset_penalty + rew_stationary_penalty)
 
         # Get feet air time statistics for logging
         air_time_stats = get_feet_air_time_stats(env)
@@ -710,17 +724,23 @@ def compute_total_reward(env) -> torch.Tensor:
         cosr_cosp = 1 - 2 * (x * x + y * y)
         roll = torch.atan2(sinr_cosp, cosr_cosp)
 
-        env._tb_writer.add_scalar("reward/total", total_reward.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("reward/task", task_reward.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("penalty/total", penalty_total.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("progress/forward_delta_x", delta_x.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("progress/forward_cumulative_x", env._cum_forward_x.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("gait/feet_air_time_mean", air_time_stats["mean_air_time"], env._tb_step)
-        env._tb_writer.add_scalar("gait/feet_air_time_max", air_time_stats["max_air_time"], env._tb_step)
-        env._tb_writer.add_scalar("balance/root_pitch_rad", pitch.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("balance/root_roll_rad", roll.mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("balance/root_pitch_deg", torch.rad2deg(pitch).mean().item(), env._tb_step)
-        env._tb_writer.add_scalar("balance/root_roll_deg", torch.rad2deg(roll).mean().item(), env._tb_step)
+        # All parameters in debug category
+        env._tb_writer.add_scalar("debug/reward_total", total_reward.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/reward_task", task_reward.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/penalty_total", penalty_total.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/feet_air_time_mean", air_time_stats["mean_air_time"], env._tb_step)
+        env._tb_writer.add_scalar("debug/feet_air_time_max", air_time_stats["max_air_time"], env._tb_step)
+        env._tb_writer.add_scalar("debug/root_pitch_rad", pitch.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/root_roll_rad", roll.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/root_pitch_deg", torch.rad2deg(pitch).mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/root_roll_deg", torch.rad2deg(roll).mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/root_height_mean", base_height.mean().item(), env._tb_step)
+        
+        # Stationary penalty logging
+        base_lin_vel_xy_norm = torch.norm(base_lin_vel[:, :2], dim=1)
+        env._tb_writer.add_scalar("debug/stationary_penalty", rew_stationary_penalty.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/base_lin_vel_xy_norm", base_lin_vel_xy_norm.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/stationary_ratio", is_stationary.mean().item(), env._tb_step)
 
     # No curriculum learning - commands are sampled at fixed intervals
 

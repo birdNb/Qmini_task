@@ -12,8 +12,8 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 class QminiRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # G1 style training configuration
     num_steps_per_env = 48  # Steps per environment per rollout
-    max_iterations = 30000
-    save_interval = 1000
+    max_iterations = 3000
+    save_interval = 300
     experiment_name = "qmini_rough"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
@@ -38,15 +38,15 @@ class QminiRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
 
 
-@configclass
-class QminiFlatPPORunnerCfg(QminiRoughPPORunnerCfg):
-    def __post_init__(self):
-        super().__post_init__()
+# @configclass
+# class QminiFlatPPORunnerCfg(QminiRoughPPORunnerCfg):
+#     def __post_init__(self):
+#         super().__post_init__()
 
-        self.max_iterations = 15000
-        self.experiment_name = "qmini_flat"
-        self.policy.actor_hidden_dims = [128, 128, 128]
-        self.policy.critic_hidden_dims = [128, 128, 128]
+#         self.max_iterations = 15000
+#         self.experiment_name = "qmini_flat"
+#         self.policy.actor_hidden_dims = [128, 128, 128]
+#         self.policy.critic_hidden_dims = [128, 128, 128]
 
 
 # Backward compatibility alias
