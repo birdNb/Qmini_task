@@ -177,6 +177,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_track_lin_vel_xy = 1.5      # Reduced from 3.0 to prevent jumping for speed
     rew_scale_lin_vel_z = -1.0            # Reduced from -2.0
     rew_scale_track_ang_vel_z = 1.5       # Reduced from 3.0
+    rew_scale_vel_tracking_error = -2.0   # Penalty for velocity tracking error (root speed vs cmd speed)
     rew_scale_alive = 0.5                 # Increased from 0.3 to encourage survival
     rew_scale_reset_penalty = -1.0        # Reduced from -10.0 to prevent excessive penalty
     rew_scale_stationary_penalty = -5.0   # High penalty for stationary root (no movement)
@@ -198,6 +199,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # 4. Gait Rewards - Reduced to prevent jumping
     rew_scale_feet_air_time = 0.3         # Reduced from 0.5
+    rew_scale_feet_air_time_mean = 5.0     # High reward for average feet air time (encourages lifting legs)
     rew_scale_feet_slide = -0.2            # Reduced from -0.3
     rew_scale_leg_lift = 0.3              # Reduced from 0.99 to prevent excessive leg lifting
     rew_scale_feet_contact_forces = -0.01  # Reduced from -0.2 to prevent excessive penalty
@@ -230,9 +232,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     reset_noise_scale = 0.1
     orientation_noise_deg = 5.0     # 减小初始姿态噪声
 
-    desired_root_height = 0.4       # Base height target: 0.35m
+    desired_root_height = 0.43       # Base height target: 0.4m
     foot_contact_force_threshold = 100.0  # Reference: 100 (feet_contact_forces threshold)
-    desired_foot_clearance = 0.05    # Reference: 0.05 (feet_clearance target_height)
+    desired_foot_clearance = 0.09    # Target foot clearance height: 0.05m (抬腿目标高度)
     leg_lift_exploration_threshold = 0.02  # 抬腿探索奖励阈值 [m]
     single_support_height_diff = 0.03  # 单腿支撑判断：高度差阈值 [m]
 

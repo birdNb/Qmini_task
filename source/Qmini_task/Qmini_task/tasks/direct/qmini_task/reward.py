@@ -395,6 +395,44 @@ def get_feet_air_time_stats(env) -> Dict[str, float]:
     }
 
 
+def compute_feet_air_time_mean_reward(env) -> torch.Tensor:
+    """High reward for average feet air time - encourages lifting legs.
+    
+    This reward encourages the robot to maintain good air time during swing phase,
+    which is essential for proper walking gait.
+    """
+    device = env.device
+    num_envs = env.scene.num_envs
+    sensors_dict = getattr(env.scene, "sensors", {})
+    left = sensors_dict.get("contact_forces_left", None)
+    right = sensors_dict.get("contact_forces_right", None)
+    combined = sensors_dict.get("contact_forces", None)
+
+    total_air_time = torch.zeros(num_envs, device=device)
+    sensor_list = []
+    if left is not None:
+        sensor_list.append(left)
+    if right is not None:
+        sensor_list.append(right)
+    if not sensor_list and combined is not None:
+        sensor_list.append(combined)
+
+    for s in sensor_list:
+        if not hasattr(s, "data"):
+            continue
+        lat = getattr(s.data, "last_air_time", None)
+        if lat is None:
+            continue
+        while lat.dim() < 2:
+            lat = lat.unsqueeze(1)
+        # Sum air time across all bodies in the sensor
+        total_air_time = total_air_time + lat.sum(dim=1)
+
+    # Return mean air time per environment (average across both feet)
+    mean_air_time = total_air_time / max(len(sensor_list), 1)
+    return mean_air_time
+
+
 def compute_ankle_gravity_projection_penalty(env) -> torch.Tensor:
     """Penalty for ankle link gravity projection deviation from vertical downward.
 
@@ -529,6 +567,9 @@ def compute_total_reward(env) -> torch.Tensor:
     lin_vel_error_xy = base_lin_vel_xy - cmd_lin_vel_xy
     lin_vel_error_norm = torch.norm(lin_vel_error_xy, dim=1)
     rew_track_lin_vel_xy = getattr(env.cfg, "rew_scale_track_lin_vel_xy", 3.0) * torch.exp(-lin_vel_error_norm ** 2 / 0.25)
+    
+    # Penalty for velocity tracking error (encourages accurate velocity tracking)
+    rew_vel_tracking_error = getattr(env.cfg, "rew_scale_vel_tracking_error", -2.0) * lin_vel_error_norm ** 2
 
     # Z direction velocity penalty (penalize vertical motion)
     rew_lin_vel_z = getattr(env.cfg, "rew_scale_lin_vel_z", -2.0) * base_lin_vel[:, 2] ** 2
@@ -572,6 +613,9 @@ def compute_total_reward(env) -> torch.Tensor:
     rew_feet_clearance = getattr(env.cfg, "rew_scale_leg_lift", 0.3) * compute_foot_clearance_reward(
         env, std=clearance_std, tanh_mult=clearance_tanh_mult, target_height=clearance_target
     )
+    
+    # High reward for average feet air time (encourages lifting legs)
+    rew_feet_air_time_mean = getattr(env.cfg, "rew_scale_feet_air_time_mean", 5.0) * compute_feet_air_time_mean_reward(env)
 
     # Feet contact forces penalty - Use linear penalty instead of squared to prevent excessive values
     rew_feet_contact_forces = torch.zeros(env.scene.num_envs, device=env.device)
@@ -685,6 +729,7 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_alive  # Increased alive reward to encourage survival
         + rew_lin_vel_z  # Penalize vertical motion
         + rew_ang_vel_xy
+        + rew_vel_tracking_error  # Penalty for velocity tracking error
         + rew_flat_orientation
         + rew_base_height  # Reference: base height penalty
         + rew_joint_acc  # Reference: joint acceleration penalty
@@ -694,6 +739,7 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_gait  # Reference: gait reward
         + rew_feet_slide
         + rew_feet_clearance  # Reference: feet clearance reward
+        + rew_feet_air_time_mean  # High reward for average feet air time
         + rew_feet_contact_forces  # Reference: feet contact forces penalty
         + rew_undesired_contacts
         + rew_joint_deviation_hip
@@ -706,8 +752,8 @@ def compute_total_reward(env) -> torch.Tensor:
 
     # Logging (two categories + progress)
     if env._tb_step % 32 == 0:
-        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance)
-        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_reset_penalty + rew_stationary_penalty)
+        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_feet_air_time_mean)
+        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_vel_tracking_error + rew_reset_penalty + rew_stationary_penalty)
 
         # Get feet air time statistics for logging
         air_time_stats = get_feet_air_time_stats(env)
@@ -741,6 +787,10 @@ def compute_total_reward(env) -> torch.Tensor:
         env._tb_writer.add_scalar("debug/stationary_penalty", rew_stationary_penalty.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/base_lin_vel_xy_norm", base_lin_vel_xy_norm.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/stationary_ratio", is_stationary.mean().item(), env._tb_step)
+        
+        # Velocity tracking and air time rewards logging
+        env._tb_writer.add_scalar("debug/vel_tracking_error_penalty", rew_vel_tracking_error.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/feet_air_time_mean_reward", rew_feet_air_time_mean.mean().item(), env._tb_step)
 
     # No curriculum learning - commands are sampled at fixed intervals
 
