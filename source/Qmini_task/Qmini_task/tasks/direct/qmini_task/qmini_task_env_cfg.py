@@ -261,7 +261,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     command_change_interval_s = 10.0  # Reference: resampling_time_range=(10.0, 10.0)
 
     # gait parameters - Following reference configuration
-    gait_cycle_duration = 0.6  # Reference: period=0.6 (gait reward)
+    gait_cycle_duration = 0.8  # Set gait cycle to 0.8s so both legs have 0.8s swing/stance
     gait_hip_amp = 0.35
     gait_knee_base = -0.6
     gait_knee_amp = 0.35
