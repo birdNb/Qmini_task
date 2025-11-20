@@ -170,7 +170,7 @@ class QminiTaskEnv(DirectRLEnv):
         marker_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/qmini_arrows",
             markers={
-                "forward": sim_utils.UsdFileCfg(
+                "root_velocity": sim_utils.UsdFileCfg(
                     usd_path=arrow_usd_path,
                     scale=(0.125, 0.125, 0.25),
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 1.0)),
@@ -324,8 +324,12 @@ class QminiTaskEnv(DirectRLEnv):
 
         root_pos = self.robot.data.root_pos_w
         root_quat = self.robot.data.root_quat_w
+        root_state = self.robot.data.root_state_w
+        root_lin_vel = root_state[:, 7:10]  # Linear velocity in world frame
+        
         pos = root_pos + self.marker_offset
 
+        # Command velocity direction (red arrow)
         cmd_xy = self._command[:, :2]
         cmd_speed = torch.norm(cmd_xy, dim=1)
         cmd_yaw = torch.atan2(cmd_xy[:, 1], cmd_xy[:, 0])
@@ -339,12 +343,26 @@ class QminiTaskEnv(DirectRLEnv):
         if zero_mask.any():
             cmd_quat[zero_mask] = root_quat[zero_mask]
 
+        # Root velocity direction (blue arrow)
+        root_vel_xy = root_lin_vel[:, :2]  # X/Y velocity components
+        root_vel_speed = torch.norm(root_vel_xy, dim=1)
+        root_vel_yaw = torch.atan2(root_vel_xy[:, 1], root_vel_xy[:, 0])
+        
+        zero_vel_mask = root_vel_speed < 1e-5
+        root_vel_quat = math_utils.quat_from_euler_xyz(
+            torch.zeros_like(root_vel_yaw),
+            torch.zeros_like(root_vel_yaw),
+            root_vel_yaw,
+        )
+        if zero_vel_mask.any():
+            root_vel_quat[zero_vel_mask] = root_quat[zero_vel_mask]
+
         positions = torch.cat([pos, pos], dim=0)
-        rotations = torch.cat([root_quat, cmd_quat], dim=0)
+        rotations = torch.cat([root_vel_quat, cmd_quat], dim=0)
         marker_ids = torch.cat(
             [
-                torch.zeros(self.scene.num_envs, dtype=torch.long, device=self.device),
-                torch.ones(self.scene.num_envs, dtype=torch.long, device=self.device),
+                torch.zeros(self.scene.num_envs, dtype=torch.long, device=self.device),  # root_velocity (blue)
+                torch.ones(self.scene.num_envs, dtype=torch.long, device=self.device),   # command (red)
             ],
             dim=0,
         )
