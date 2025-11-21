@@ -155,8 +155,14 @@ class QminiTaskEnv(DirectRLEnv):
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         self.scene.articulations["robot"] = self.robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.6, 0.6, 0.6))
-        light_cfg.func("/World/Light", light_cfg)
+        # Register sky light with HDR texture
+        if hasattr(self.cfg, "sky_light") and self.cfg.sky_light is not None:
+            # Spawn the sky light using the spawn configuration
+            self.cfg.sky_light.spawn.func(self.cfg.sky_light.prim_path, self.cfg.sky_light.spawn)
+        # Keep existing simple light as fallback (only if sky_light is not configured)
+        else:
+            light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.6, 0.6, 0.6))
+            light_cfg.func("/World/Light", light_cfg)
         # Register sensors
         # Height scanner for terrain height detection
         if hasattr(self.cfg, "height_scanner"):
@@ -183,6 +189,46 @@ class QminiTaskEnv(DirectRLEnv):
             },
         )
         self.visualization_markers = VisualizationMarkers(cfg=marker_cfg)
+
+    def _get_ground_height(self) -> torch.Tensor:
+        """Get ground height relative to base_link using height_scanner.
+        
+        Returns ground height in world frame for each environment.
+        If height_scanner is not available, returns zeros (assumes ground at z=0).
+        """
+        sensors = getattr(self.scene, "sensors", {})
+        height_scanner = sensors.get("height_scanner", None)
+        
+        if height_scanner is None or not hasattr(height_scanner, "data"):
+            # Fallback: assume ground at z=0
+            return torch.zeros(self.scene.num_envs, device=self.device)
+        
+        try:
+            # Get ray hit positions in world frame
+            ray_hits_w = height_scanner.data.ray_hits_w  # [N, B, 3] where N=num_envs, B=num_rays
+            if ray_hits_w is None:
+                return torch.zeros(self.scene.num_envs, device=self.device)
+            
+            # Get minimum Z coordinate from all ray hits (closest ground point)
+            # ray_hits_w[:, :, 2] is Z coordinate for all rays
+            # Take minimum across rays to get ground height
+            ground_height = torch.min(ray_hits_w[:, :, 2], dim=1)[0]  # [N]
+            
+            return ground_height
+        except Exception:
+            # Fallback: assume ground at z=0
+            return torch.zeros(self.scene.num_envs, device=self.device)
+    
+    def _get_base_height_relative_to_ground(self) -> torch.Tensor:
+        """Get base height relative to ground (not absolute world height).
+        
+        Returns base height above ground for each environment.
+        """
+        root_state = self.robot.data.root_state_w
+        base_height_abs = root_state[:, 2]  # Absolute height in world frame
+        ground_height = self._get_ground_height()  # Ground height in world frame
+        base_height_rel = base_height_abs - ground_height  # Relative height above ground
+        return base_height_rel
 
     @staticmethod
     def _quat_to_euler(quat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -501,8 +547,9 @@ class QminiTaskEnv(DirectRLEnv):
 
         root_state = self.robot.data.root_state_w
         base_quat = root_state[:, 3:7]
-        base_height = root_state[:, 2]
-        too_low = base_height < self._min_height
+        # Use relative height (above ground) instead of absolute height
+        base_height_rel = self._get_base_height_relative_to_ground()
+        too_low = base_height_rel < self._min_height
 
         roll, pitch, _ = self._quat_to_euler(base_quat)
         out_of_limits = too_low  # tilt-based reset disabled per user request

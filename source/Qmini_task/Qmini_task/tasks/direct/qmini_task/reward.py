@@ -433,6 +433,157 @@ def compute_feet_air_time_mean_reward(env) -> torch.Tensor:
     return mean_air_time
 
 
+def compute_target_air_time_reward(env, target_air_time: float = 0.3, tolerance: float = 0.1) -> torch.Tensor:
+    """Reward for foot air time being close to target (0.3s).
+    
+    This reward encourages the robot to maintain a consistent air time of 0.3s
+    during swing phase, which is essential for proper walking gait.
+    
+    Args:
+        env: The environment instance
+        target_air_time: Target air time in seconds (default: 0.3s)
+        tolerance: Tolerance for air time deviation (default: 0.1s)
+    
+    Returns:
+        Reward tensor that peaks when air time is close to target
+    """
+    device = env.device
+    num_envs = env.scene.num_envs
+    sensors_dict = getattr(env.scene, "sensors", {})
+    left = sensors_dict.get("contact_forces_left", None)
+    right = sensors_dict.get("contact_forces_right", None)
+    combined = sensors_dict.get("contact_forces", None)
+
+    total_air_time = torch.zeros(num_envs, device=device)
+    sensor_list = []
+    if left is not None:
+        sensor_list.append(left)
+    if right is not None:
+        sensor_list.append(right)
+    if not sensor_list and combined is not None:
+        sensor_list.append(combined)
+
+    for s in sensor_list:
+        if not hasattr(s, "data"):
+            continue
+        lat = getattr(s.data, "last_air_time", None)
+        if lat is None:
+            continue
+        while lat.dim() < 2:
+            lat = lat.unsqueeze(1)
+        # Sum air time across all bodies in the sensor
+        total_air_time = total_air_time + lat.sum(dim=1)
+
+    # Average air time per foot
+    mean_air_time = total_air_time / max(len(sensor_list), 1)
+    
+    # Compute reward: exponential reward centered at target_air_time
+    air_time_error = torch.abs(mean_air_time - target_air_time)
+    # Normalize by tolerance: reward peaks when error is 0, decreases as error increases
+    normalized_error = air_time_error / (tolerance + 1e-6)
+    # Exponential reward: 1.0 when error=0, decreases exponentially
+    reward = torch.exp(-normalized_error ** 2)
+    
+    return reward
+
+
+def compute_feet_height_consistency_penalty(env, threshold: float = 0.02) -> torch.Tensor:
+    """Penalty for inconsistent foot heights when both feet are in contact.
+    
+    This penalty ensures that when both feet are on the ground, they maintain
+    similar heights (consistent posture), preventing one foot from being too
+    low (pointing at ground) while the other is higher.
+    
+    Args:
+        env: The environment instance
+        threshold: Maximum allowed height difference when both feet are in contact (default: 0.02m)
+    
+    Returns:
+        Penalty tensor: 0.0 when heights are consistent or only one foot is in contact,
+                        positive value when both feet are in contact but heights differ significantly
+    """
+    device = env.device
+    num_envs = env.scene.num_envs
+    
+    # Get contact sensors
+    sensors = getattr(env.scene, "sensors", {})
+    left = sensors.get("contact_forces_left", None)
+    right = sensors.get("contact_forces_right", None)
+    combined = sensors.get("contact_forces", None)
+    
+    # Helper to get contact mask
+    def get_contact_mask(sensor) -> torch.Tensor | None:
+        if sensor is None or not hasattr(sensor, "data"):
+            return None
+        try:
+            forces = sensor.data.net_forces_w
+            if forces is None:
+                return None
+            contact_mask = torch.norm(forces, dim=-1) > getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+            if contact_mask.dim() > 1:
+                contact_mask = contact_mask.any(dim=-1)
+            return contact_mask.float()
+        except Exception:
+            return None
+    
+    # Get contact status
+    left_contact = get_contact_mask(left)
+    right_contact = get_contact_mask(right)
+    
+    # Fallback to combined sensor
+    if left_contact is None or right_contact is None:
+        if combined is not None:
+            cmask = get_contact_mask(combined)
+            if cmask is not None:
+                try:
+                    forces = combined.data.net_forces_w
+                    if forces is not None and forces.shape[1] >= 2:
+                        left_forces = forces[:, 0, :]
+                        right_forces = forces[:, 1, :]
+                        force_threshold = getattr(env.cfg, "foot_contact_force_threshold", 100.0)
+                        left_contact = (torch.norm(left_forces, dim=-1) > force_threshold).float()
+                        right_contact = (torch.norm(right_forces, dim=-1) > force_threshold).float()
+                    else:
+                        left_contact = cmask
+                        right_contact = cmask
+                except Exception:
+                    left_contact = cmask
+                    right_contact = cmask
+        else:
+            return torch.zeros(num_envs, device=device)
+    
+    # Get foot heights
+    body_pos_w = env.robot.data.body_pos_w  # [N, bodies, 3]
+    
+    # Find ankle body indices
+    ankle_names = ["LL_ankle", "RL_ankle"]
+    ankle_indices = []
+    for name in ankle_names:
+        ids, _ = env.robot.find_bodies([name])
+        if len(ids) > 0:
+            ankle_indices.append(int(ids[0]))
+        else:
+            return torch.zeros(num_envs, device=device)
+    
+    if len(ankle_indices) < 2:
+        return torch.zeros(num_envs, device=device)
+    
+    left_height = body_pos_w[:, ankle_indices[0], 2]  # [N]
+    right_height = body_pos_w[:, ankle_indices[1], 2]  # [N]
+    
+    # Height difference
+    height_diff = torch.abs(left_height - right_height)  # [N]
+    
+    # Both feet in contact
+    both_contact = (left_contact > 0.5) & (right_contact > 0.5)  # [N]
+    
+    # Penalty: when both feet are in contact, penalize height difference exceeding threshold
+    excess_height_diff = torch.clamp(height_diff - threshold, min=0.0)  # [N]
+    penalty = excess_height_diff * both_contact.float()  # [N]
+    
+    return penalty
+
+
 def compute_ankle_gravity_projection_penalty(env) -> torch.Tensor:
     """Penalty for ankle link gravity projection deviation from vertical downward.
 
@@ -510,7 +661,7 @@ def compute_root_pitch_roll_penalty(env, base_quat: torch.Tensor) -> torch.Tenso
     return total_penalty
 
 
-def compute_imbalance_penalty(env, base_quat: torch.Tensor, base_height: torch.Tensor) -> torch.Tensor:
+def compute_imbalance_penalty(env, base_quat: torch.Tensor, base_height_rel: torch.Tensor) -> torch.Tensor:
     """High penalty when robot is close to imbalance/reset conditions.
 
     Penalizes when pitch/roll angles exceed thresholds or height drops too low.
@@ -538,7 +689,7 @@ def compute_imbalance_penalty(env, base_quat: torch.Tensor, base_height: torch.T
     # Check if exceeding thresholds
     pitch_imbalance = torch.abs(pitch) > pitch_threshold
     roll_imbalance = torch.abs(roll) > roll_threshold
-    height_imbalance = base_height < height_threshold
+    height_imbalance = base_height_rel < height_threshold
 
     # Penalty: 1.0 if any imbalance condition is met, 0.0 otherwise
     any_imbalance = pitch_imbalance | roll_imbalance | height_imbalance
@@ -552,7 +703,8 @@ def compute_total_reward(env) -> torch.Tensor:
     # root/base states
     root_state = env.robot.data.root_state_w
     base_quat = root_state[:, 3:7]
-    base_height = root_state[:, 2]
+    # Use relative height (above ground) instead of absolute height
+    base_height = env._get_base_height_relative_to_ground()
     base_lin_vel = root_state[:, 7:10]
     base_ang_vel = root_state[:, 10:13]
 
@@ -616,6 +768,19 @@ def compute_total_reward(env) -> torch.Tensor:
     
     # High reward for average feet air time (encourages lifting legs)
     rew_feet_air_time_mean = getattr(env.cfg, "rew_scale_feet_air_time_mean", 5.0) * compute_feet_air_time_mean_reward(env)
+    
+    # Reward for target air time (0.3s) - encourages consistent air time
+    target_air_time = getattr(env.cfg, "target_foot_air_time", 0.3)
+    air_time_tolerance = getattr(env.cfg, "air_time_tolerance", 0.1)
+    rew_target_air_time = getattr(env.cfg, "rew_scale_target_air_time", 2.0) * compute_target_air_time_reward(
+        env, target_air_time=target_air_time, tolerance=air_time_tolerance
+    )
+    
+    # Penalty for inconsistent foot heights when both feet are in contact
+    feet_height_threshold = getattr(env.cfg, "feet_height_consistency_threshold", 0.02)
+    rew_feet_height_consistency = getattr(env.cfg, "rew_scale_feet_height_consistency", -5.0) * compute_feet_height_consistency_penalty(
+        env, threshold=feet_height_threshold
+    )
 
     # Feet contact forces penalty - Use linear penalty instead of squared to prevent excessive values
     rew_feet_contact_forces = torch.zeros(env.scene.num_envs, device=env.device)
@@ -740,6 +905,8 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_feet_slide
         + rew_feet_clearance  # Reference: feet clearance reward
         + rew_feet_air_time_mean  # High reward for average feet air time
+        + rew_target_air_time  # Reward for target air time (0.3s)
+        + rew_feet_height_consistency  # Penalty for inconsistent foot heights when both feet are in contact
         + rew_feet_contact_forces  # Reference: feet contact forces penalty
         + rew_undesired_contacts
         + rew_joint_deviation_hip
@@ -752,8 +919,8 @@ def compute_total_reward(env) -> torch.Tensor:
 
     # Logging (two categories + progress)
     if env._tb_step % 32 == 0:
-        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_feet_air_time_mean)
-        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_vel_tracking_error + rew_reset_penalty + rew_stationary_penalty)
+        task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_feet_air_time_mean + rew_target_air_time)
+        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_vel_tracking_error + rew_reset_penalty + rew_stationary_penalty + rew_joint_deviation_knee + rew_feet_height_consistency)
 
         # Get feet air time statistics for logging
         air_time_stats = get_feet_air_time_stats(env)
@@ -791,6 +958,14 @@ def compute_total_reward(env) -> torch.Tensor:
         # Velocity tracking and air time rewards logging
         env._tb_writer.add_scalar("debug/vel_tracking_error_penalty", rew_vel_tracking_error.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/feet_air_time_mean_reward", rew_feet_air_time_mean.mean().item(), env._tb_step)
+        
+        # Knee joint deviation logging
+        if kfe_only_indices:
+            knee_pos_mean = knee_pos.mean().item()
+            knee_deviation_mean = knee_deviation.mean().item()
+            env._tb_writer.add_scalar("debug/knee_joint_pos_mean", knee_pos_mean, env._tb_step)
+            env._tb_writer.add_scalar("debug/knee_joint_deviation_mean", knee_deviation_mean, env._tb_step)
+            env._tb_writer.add_scalar("debug/knee_joint_deviation_penalty", rew_joint_deviation_knee.mean().item(), env._tb_step)
 
     # No curriculum learning - commands are sampled at fixed intervals
 

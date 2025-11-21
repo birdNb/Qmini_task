@@ -8,7 +8,7 @@ import math
 import isaaclab.sim as sim_utils
 
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
@@ -121,7 +121,7 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
 class QminiTaskEnvCfg(DirectRLEnvCfg):
     # env - Following reference configuration
     decimation = 4  # Reference: 4 (increased from 2)
-    episode_length_s = 20.0  # Reference: 20.0 (increased from 10.0)
+    episode_length_s = 30.0  # Reference: 20.0 (increased from 10.0)
     # - spaces definition
     action_space = 10
     observation_space = 40  # Reference: 3+3+3+10+10+10+1 = 40 (base_ang_vel, projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel, last_action, gait_phase)
@@ -192,12 +192,12 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "LL_joint1": 0.0,
         "LL_joint2": 0.0,
         "LL_joint3": 0.0,
-        "LL_joint4": 0.0,
+        "LL_joint4": -0.2,  # Knee joint target: -0.8 (Reference: -0.8)
         "LL_joint5": 0.0,
         "RL_joint1": 0.0,
         "RL_joint2": 0.0,
         "RL_joint3": 0.0,
-        "RL_joint4": 0.0,
+        "RL_joint4": -0.2,  # Knee joint target: -0.8 (Reference: -0.8)
         "RL_joint5": 0.0,
     }
 
@@ -229,20 +229,27 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # 4. Gait Rewards - Reduced to prevent jumping
     rew_scale_feet_air_time = 0.3         # Reduced from 0.5
     rew_scale_feet_air_time_mean = 5.0     # High reward for average feet air time (encourages lifting legs)
+    rew_scale_target_air_time = 2.0        # Reward for target air time (0.3s) - encourages consistent air time
     rew_scale_feet_slide = -0.2            # Reduced from -0.3
     rew_scale_leg_lift = 0.3              # Reduced from 0.99 to prevent excessive leg lifting
     rew_scale_feet_contact_forces = -0.01  # Reduced from -0.2 to prevent excessive penalty
+    rew_scale_feet_height_consistency = -5.0  # Penalty for inconsistent foot heights when both feet are in contact
 
     # Gait parameters for compute_feet_gait
     gait_offset = [0.0, 0.5]              # Reference: offset=[0.0, 0.5]
     gait_threshold = 0.55                  # Reference: threshold=0.55
     feet_clearance_std = 0.05              # Reference: std=0.05
     feet_clearance_tanh_mult = 2.0        # Reference: tanh_mult=2.0
+    
+    # Foot air time target parameters
+    target_foot_air_time = 0.3            # Target foot air time: 0.3s
+    air_time_tolerance = 0.1              # Tolerance for air time deviation: 0.1s
+    feet_height_consistency_threshold = 0.02  # Maximum allowed height difference when both feet are in contact: 0.02m (2cm)
 
     # 5. Contact Penalties - Reduced to reasonable values
     rew_scale_undesired_contacts = -0.5   # Reduced from -1.0
     rew_scale_joint_deviation_hip = -0.2  # Reduced from -0.5
-    rew_scale_joint_deviation_knee = 0.0  # Not in reference
+    rew_scale_joint_deviation_knee = -0.5  # Reduced penalty for knee joint deviation from target position
     rew_scale_ankle_gravity = 0.0         # Not in reference
 
     # success / failure thresholds - Following reference configuration
@@ -325,6 +332,15 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         history_length=3,
         track_air_time=True,
         debug_vis=True,
+    )
+
+    # lights
+    sky_light: AssetBaseCfg = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file="/home/bird/isaacSim/Learn/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
     )
 
     def __post_init__(self):
