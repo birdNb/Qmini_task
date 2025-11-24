@@ -205,8 +205,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # 1. Task Rewards - Reduced to prevent jumping behavior
     rew_scale_track_lin_vel_xy = 1.5      # Reduced from 3.0 to prevent jumping for speed
     rew_scale_lin_vel_z = -1.0            # Reduced from -2.0
-    rew_scale_track_ang_vel_z = 1.5       # Reduced from 3.0
+    rew_scale_track_ang_vel_z = 3.0       # Increased to encourage rotation/turning
     rew_scale_vel_tracking_error = -2.0   # Penalty for velocity tracking error (root speed vs cmd speed)
+    rew_scale_ang_vel_tracking_error = -1.0  # Penalty for angular velocity tracking error (encourages accurate rotation)
     rew_scale_alive = 0.5                 # Increased from 0.3 to encourage survival
     rew_scale_reset_penalty = -1.0        # Reduced from -10.0 to prevent excessive penalty
     rew_scale_stationary_penalty = -5.0   # High penalty for stationary root (no movement)
@@ -293,7 +294,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # command profile - Following reference configuration
     command_lin_vel_x_range = (-0.5, 0.5)  # Reference: ranges.lin_vel_x=(-0.5, 0.5) - allow forward/backward
     command_lin_vel_y_range = (-0.2, 0.2)  # Reference: ranges.lin_vel_y=(-0.2, 0.2) - allow lateral movement
-    command_yaw_range = (-0.1, 0.1)  # Reference: ranges.ang_vel_z=(-0.1, 0.1) - allow rotation
+    command_yaw_range = (-0.5, 0.5)  # Increased from (-0.1, 0.1) to allow faster rotation/turning
     command_change_interval_s = 10.0  # Reference: resampling_time_range=(10.0, 10.0)
 
     # gait parameters - Following reference configuration

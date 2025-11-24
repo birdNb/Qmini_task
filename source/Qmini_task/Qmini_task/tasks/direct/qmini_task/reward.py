@@ -729,6 +729,9 @@ def compute_total_reward(env) -> torch.Tensor:
     cmd_ang_vel_z = env._command[:, 2]
     ang_vel_error_z = base_ang_vel[:, 2] - cmd_ang_vel_z
     rew_track_ang_vel_z = getattr(env.cfg, "rew_scale_track_ang_vel_z", 3.0) * torch.exp(-ang_vel_error_z ** 2 / 0.25)
+    
+    # Penalty for angular velocity tracking error (encourages accurate rotation)
+    rew_ang_vel_tracking_error = getattr(env.cfg, "rew_scale_ang_vel_tracking_error", -1.0) * ang_vel_error_z ** 2
 
     # Alive reward (increased to encourage survival)
     rew_alive = getattr(env.cfg, "rew_scale_alive", 2.0) * torch.ones(env.scene.num_envs, device=env.device)
@@ -895,6 +898,7 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_lin_vel_z  # Penalize vertical motion
         + rew_ang_vel_xy
         + rew_vel_tracking_error  # Penalty for velocity tracking error
+        + rew_ang_vel_tracking_error  # Penalty for angular velocity tracking error
         + rew_flat_orientation
         + rew_base_height  # Reference: base height penalty
         + rew_joint_acc  # Reference: joint acceleration penalty
@@ -920,7 +924,7 @@ def compute_total_reward(env) -> torch.Tensor:
     # Logging (two categories + progress)
     if env._tb_step % 32 == 0:
         task_reward = (rew_track_lin_vel_xy + rew_track_ang_vel_z + rew_gait + rew_feet_clearance + rew_feet_air_time_mean + rew_target_air_time)
-        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_vel_tracking_error + rew_reset_penalty + rew_stationary_penalty + rew_joint_deviation_knee + rew_feet_height_consistency)
+        penalty_total = -(rew_lin_vel_z + rew_root_pitch_roll + rew_imbalance + rew_ang_vel_xy + rew_flat_orientation + rew_action_rate + rew_joint_torques + rew_undesired_contacts + rew_feet_slide + rew_feet_contact_forces + rew_vel_tracking_error + rew_ang_vel_tracking_error + rew_reset_penalty + rew_stationary_penalty + rew_joint_deviation_knee + rew_feet_height_consistency)
 
         # Get feet air time statistics for logging
         air_time_stats = get_feet_air_time_stats(env)
