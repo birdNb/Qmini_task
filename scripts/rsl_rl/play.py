@@ -254,7 +254,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Right stick: axis 3 (X)
             left_stick_y_raw = -gamepad.get_axis(1) if gamepad.get_numaxes() > 1 else 0.0  # Forward/Backward
             left_stick_x_raw = -gamepad.get_axis(0) if gamepad.get_numaxes() > 0 else 0.0   # Lateral (inverted to fix direction)
-            right_stick_x_raw = gamepad.get_axis(3) if gamepad.get_numaxes() > 3 else 0.0  # Yaw
+            right_stick_x_raw = -gamepad.get_axis(3) if gamepad.get_numaxes() > 3 else 0.0  # Yaw (inverted to fix direction)
             
             # Map to velocity commands
             # Dead zone to avoid drift

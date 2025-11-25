@@ -202,39 +202,39 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     }
 
     # reward scales - Adjusted to prevent jumping and ensure reasonable reward values
-    # 1. Task Rewards - Reduced to prevent jumping behavior
-    rew_scale_track_lin_vel_xy = 1.5      # Reduced from 3.0 to prevent jumping for speed
-    rew_scale_lin_vel_z = -1.0            # Reduced from -2.0
-    rew_scale_track_ang_vel_z = 3.0       # Increased to encourage rotation/turning
-    rew_scale_vel_tracking_error = -2.0   # Penalty for velocity tracking error (root speed vs cmd speed)
-    rew_scale_ang_vel_tracking_error = -1.0  # Penalty for angular velocity tracking error (encourages accurate rotation)
-    rew_scale_alive = 0.5                 # Increased from 0.3 to encourage survival
-    rew_scale_reset_penalty = -1.0        # Reduced from -10.0 to prevent excessive penalty
-    rew_scale_stationary_penalty = -5.0   # High penalty for stationary root (no movement)
+    # 1. Task Rewards - Scaled down by 1000x to target ~10 reward at convergence
+    rew_scale_track_lin_vel_xy = 0.0015      # Scaled down from 1.5
+    rew_scale_lin_vel_z = -0.001            # Scaled down from -1.0
+    rew_scale_track_ang_vel_z = 0.003       # Scaled down from 3.0
+    rew_scale_vel_tracking_error = -0.002   # Scaled down from -2.0
+    rew_scale_ang_vel_tracking_error = -0.001  # Scaled down from -1.0
+    rew_scale_alive = 0.0005                 # Scaled down from 0.5
+    rew_scale_reset_penalty = -0.001        # Scaled down from -1.0
+    rew_scale_stationary_penalty = -0.005   # Scaled down from -5.0
     stationary_velocity_threshold = 0.05  # Velocity threshold below which robot is considered stationary [m/s]
 
-    # 2. Base Stability Penalties - Reduced to reasonable values
-    rew_scale_ang_vel_xy = -0.3            # Reduced from -0.5
-    rew_scale_flat_orientation = -0.5     # Reduced from -1.0
-    rew_scale_base_height = -8.0          # Increased to encourage standing (target: 0.40m)
-    rew_scale_base_height_reward = 2.0     # Positive reward when close to target height
+    # 2. Base Stability Penalties - Scaled down by 1000x
+    rew_scale_ang_vel_xy = -0.0003            # Scaled down from -0.3
+    rew_scale_flat_orientation = -0.0005     # Scaled down from -0.5
+    rew_scale_base_height = -0.008          # Scaled down from -8.0
+    rew_scale_base_height_reward = 0.002     # Scaled down from 2.0
     base_height_reward_tolerance = 0.05    # 5cm tolerance for height reward
-    rew_scale_root_pitch_roll = -0.5      # Reduced from -1.0
+    rew_scale_root_pitch_roll = -0.0005      # Scaled down from -0.5
 
-    # 3. Action Penalties - Keep reasonable
-    rew_scale_joint_acc = -2.5e-7         # Keep as is
-    rew_scale_action_rate = -0.05         # Reduced from -0.10
-    rew_scale_joint_torques = -1.0e-5     # Keep existing
-    rew_scale_dof_pos_limits = -2.0       # Reduced from -5.0
+    # 3. Action Penalties - Scaled down by 1000x
+    rew_scale_joint_acc = -2.5e-10         # Scaled down from -2.5e-7
+    rew_scale_action_rate = -0.00005         # Scaled down from -0.05
+    rew_scale_joint_torques = -1.0e-8     # Scaled down from -1.0e-5
+    rew_scale_dof_pos_limits = -0.002       # Scaled down from -2.0
 
-    # 4. Gait Rewards - Reduced to prevent jumping
-    rew_scale_feet_air_time = 0.3         # Reduced from 0.5
-    rew_scale_feet_air_time_mean = 5.0     # High reward for average feet air time (encourages lifting legs)
-    rew_scale_target_air_time = 2.0        # Reward for target air time (0.3s) - encourages consistent air time
-    rew_scale_feet_slide = -0.2            # Reduced from -0.3
-    rew_scale_leg_lift = 0.3              # Reduced from 0.99 to prevent excessive leg lifting
-    rew_scale_feet_contact_forces = -0.01  # Reduced from -0.2 to prevent excessive penalty
-    rew_scale_feet_height_consistency = -5.0  # Penalty for inconsistent foot heights when both feet are in contact
+    # 4. Gait Rewards - Scaled down by 1000x
+    rew_scale_feet_air_time = 0.0003         # Scaled down from 0.3
+    rew_scale_feet_air_time_mean = 0.005     # Scaled down from 5.0
+    rew_scale_target_air_time = 0.002        # Scaled down from 2.0
+    rew_scale_feet_slide = -0.0002            # Scaled down from -0.2
+    rew_scale_leg_lift = 0.0003              # Scaled down from 0.3
+    rew_scale_feet_contact_forces = -0.00001  # Scaled down from -0.01
+    rew_scale_feet_height_consistency = -0.005  # Scaled down from -5.0
 
     # Gait parameters for compute_feet_gait
     gait_offset = [0.0, 0.5]              # Reference: offset=[0.0, 0.5]
@@ -247,10 +247,10 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     air_time_tolerance = 0.1              # Tolerance for air time deviation: 0.1s
     feet_height_consistency_threshold = 0.02  # Maximum allowed height difference when both feet are in contact: 0.02m (2cm)
 
-    # 5. Contact Penalties - Reduced to reasonable values
-    rew_scale_undesired_contacts = -0.5   # Reduced from -1.0
-    rew_scale_joint_deviation_hip = -0.2  # Reduced from -0.5
-    rew_scale_joint_deviation_knee = -0.5  # Reduced penalty for knee joint deviation from target position
+    # 5. Contact Penalties - Scaled down by 1000x
+    rew_scale_undesired_contacts = -0.0005   # Scaled down from -0.5
+    rew_scale_joint_deviation_hip = -0.0002  # Scaled down from -0.2
+    rew_scale_joint_deviation_knee = -0.0005  # Scaled down from -0.5
     rew_scale_ankle_gravity = 0.0         # Not in reference
 
     # success / failure thresholds - Following reference configuration
@@ -276,7 +276,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     single_support_height_diff = 0.03  # 单腿支撑判断：高度差阈值 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
-    rew_scale_imbalance_penalty = -2.0   # Reduced from -50.0 to prevent excessive penalty
+    rew_scale_imbalance_penalty = -0.002   # Scaled down from -2.0 (target ~10 reward at convergence)
     # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
     joint_velocity_limits = (
         1.0,   # LL_joint1
