@@ -18,6 +18,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from .qmini_task_env_cfg import QminiTaskEnvCfg
+from .reward import compute_rewards
 
 
 class QminiTaskEnv(DirectRLEnv):
@@ -154,15 +155,67 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_targets = targets
 
     def _get_observations(self) -> dict:
-        current_pos = self.joint_pos[:, self._controlled_joint_indices]
-        current_vel = self.joint_vel[:, self._controlled_joint_indices]
+        """Get 42-dimensional observations following walk_policy format.
+        
+        Observation breakdown:
+        1. base_lin_vel (3): Base linear velocity [vx, vy, vz]
+        2. base_ang_vel (3): Base angular velocity [ωx, ωy, ωz]
+        3. projected_gravity (3): Gravity projected in base frame
+        4. velocity_commands (3): Velocity commands [target_vx, target_vy, target_ωz] (zeros for stand-up)
+        5. joint_pos_rel (10): Joint positions relative to target
+        6. joint_vel_rel (10): Joint velocities relative to target
+        7. last_action (10): Previous action
+        Total: 42 dimensions
+        """
         root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]
-        base_lin_vel = root_state[:, 7:10]
-        base_ang_vel = root_state[:, 10:13]
+        base_quat = root_state[:, 3:7]  # [w, x, y, z]
+        base_lin_vel = root_state[:, 7:10]  # [vx, vy, vz]
+        base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
+        
+        # 1. base_lin_vel (3 dims) - scaled
+        obs_base_lin_vel = base_lin_vel * 0.2  # Scale down for stability
+        
+        # 2. base_ang_vel (3 dims) - scaled
+        obs_base_ang_vel = base_ang_vel * 0.2
+        
+        # 3. projected_gravity (3 dims) - gravity vector in base frame
+        # Gravity in world frame: [0, 0, -1] (normalized)
+        gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
+        # Rotate gravity to base frame (inverse quaternion rotation)
+        # For quaternion [w, x, y, z], inverse is [w, -x, -y, -z]
+        quat_inv = base_quat.clone()
+        quat_inv[:, 1:4] = -quat_inv[:, 1:4]  # Negate x, y, z components
+        projected_gravity = self._quat_apply(quat_inv, gravity_world)
+        
+        # 4. velocity_commands (3 dims) - zeros for stand-up task
+        velocity_commands = torch.zeros((self.scene.num_envs, 3), device=self.device)
+        
+        # 5. joint_pos_rel (10 dims) - joint positions relative to target
+        all_joint_pos = self.joint_pos[:, self._controlled_joint_indices]
+        all_joint_pos_rel = all_joint_pos - self._target_pos.unsqueeze(0)
+        
+        # 6. joint_vel_rel (10 dims) - joint velocities (already relative)
+        joint_vel = self.joint_vel[:, self._controlled_joint_indices]
+        obs_joint_vel = joint_vel * 0.05  # Scale down
+        
+        # 7. last_action (10 dims)
+        obs_actions = self._prev_actions
+        
+        # Concatenate all observations: 3+3+3+3+10+10+10 = 42 dims
+        obs = torch.cat(
+            (
+                obs_base_lin_vel,      # 3
+                obs_base_ang_vel,       # 3
+                projected_gravity,      # 3
+                velocity_commands,      # 3
+                all_joint_pos_rel,      # 10
+                obs_joint_vel,          # 10
+                obs_actions,            # 10
+            ),
+            dim=1,
+        )
+        
         roll, pitch, _ = self._quat_to_euler(base_quat)
-        obs = torch.cat((current_pos, current_vel, base_quat, base_lin_vel, base_ang_vel), dim=1)
-
         if self._tb_step % 128 == 0:
             self._tb_writer.add_scalar("obs/roll_deg", torch.rad2deg(roll).mean().item(), self._tb_step)
             self._tb_writer.add_scalar("obs/pitch_deg", torch.rad2deg(pitch).mean().item(), self._tb_step)
@@ -170,81 +223,17 @@ class QminiTaskEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        current_pos = self.joint_pos[:, self._controlled_joint_indices]
-        current_vel = self.joint_vel[:, self._controlled_joint_indices]
-        target_pos = self._target_pos.unsqueeze(0).expand_as(current_pos)
-
-        root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]
-        base_lin_vel = root_state[:, 7:10]
-        base_ang_vel = root_state[:, 10:13]
-        roll, pitch, _ = self._quat_to_euler(base_quat)
-        orientation_error = torch.sqrt(roll * roll + pitch * pitch)
-        roll_deg = torch.rad2deg(roll)
-        pitch_deg = torch.rad2deg(pitch)
-
-        pos_error = current_pos - target_pos
-        joint_error = torch.norm(pos_error, dim=1)
-        joint_vel_norm = torch.norm(current_vel, dim=1)
-        lin_vel_norm = torch.norm(base_lin_vel, dim=1)
-        ang_vel_norm = torch.norm(base_ang_vel, dim=1)
-        action_rate = torch.norm(self.actions - self._prev_actions, dim=1)
-
-        rew_alive = self.cfg.rew_scale_alive * (1.0 - self.reset_terminated.float())
-        rew_term = self.cfg.rew_scale_terminated * self.reset_terminated.float()
-        rew_joint = -self.cfg.rew_scale_joint * joint_error
-        rew_joint_vel = -self.cfg.rew_scale_joint_vel * joint_vel_norm
-        rew_upright = -self.cfg.rew_scale_upright * orientation_error
-        rew_base_lin = -self.cfg.rew_scale_base_lin_vel * lin_vel_norm
-        rew_base_ang = -self.cfg.rew_scale_base_ang_vel * ang_vel_norm
-        rew_action = -self.cfg.rew_scale_action_rate * action_rate
-
-        orientation_ok = (torch.abs(roll) < self.cfg.success_pitch_tol) & (
-            torch.abs(pitch) < self.cfg.success_pitch_tol
-        )
-        success_mask = (torch.max(torch.abs(pos_error), dim=1).values < self._success_joint_tol) & orientation_ok
-        rew_success = self.cfg.rew_scale_success * success_mask.float()
-
-        total_reward = (
-            rew_alive
-            + rew_term
-            + rew_joint
-            + rew_joint_vel
-            + rew_upright
-            + rew_base_lin
-            + rew_base_ang
-            + rew_action
-            + rew_success
-        )
-
-        if self._tb_step % 32 == 0:
-            self._tb_writer.add_scalar("pose/roll_deg", roll_deg.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("pose/pitch_deg", pitch_deg.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/total", total_reward.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/upright_penalty", rew_upright.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/joint_penalty", rew_joint.mean().item(), self._tb_step)
-            self._tb_writer.add_scalar("reward/action_rate_penalty", rew_action.mean().item(), self._tb_step)
-
+        total_reward = compute_rewards(self)
         self._tb_step += 1
         self._prev_actions = self.actions.clone()
-        self._tb_step += 1
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.joint_pos = self.robot.data.joint_pos
         self.joint_vel = self.robot.data.joint_vel
 
-        root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]
-        base_height = root_state[:, 2]
-        too_low = base_height < self._min_height
-
-        roll, pitch, _ = self._quat_to_euler(base_quat)
-        tilt_exceeded = (torch.abs(pitch) > self.cfg.failure_tilt_angle) | (
-            torch.abs(roll) > self.cfg.failure_tilt_angle
-        )
-
-        out_of_limits = too_low | tilt_exceeded
+        # Only time_out, no pose-related resets
+        out_of_limits = torch.zeros(self.scene.num_envs, dtype=torch.bool, device=self.device)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         return out_of_limits, time_out
 
@@ -256,27 +245,35 @@ class QminiTaskEnv(DirectRLEnv):
         joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
 
+        default_root_state = self.robot.data.default_root_state[env_ids].clone()
+        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        default_root_state[:, 7:] = 0.0  # Zero velocities
+
+        # Random rotation around X/Y axis: ±90 degrees
+        # This allows exploring different fall directions
+        num_envs = len(env_ids)
+        device = joint_pos.device
+        
+        # Random roll (rotation around X axis): ±90 degrees
+        random_roll = (torch.rand(num_envs, device=device) - 0.5) * 2.0 * math.pi / 2.0  # [-90°, +90°]
+        
+        # Random pitch (rotation around Y axis): ±90 degrees
+        random_pitch = (torch.rand(num_envs, device=device) - 0.5) * 2.0 * math.pi / 2.0  # [-90°, +90°]
+        
+        # Random yaw (rotation around Z axis): full 360 degrees
+        random_yaw = torch.rand(num_envs, device=device) * 2.0 * math.pi - math.pi  # [-180°, +180°]
+        
+        # Convert to quaternion
+        initial_quat = self._euler_to_quat(random_roll, random_pitch, random_yaw)
+        default_root_state[:, 3:7] = initial_quat
+        
+        # Set joints to target position with noise
         target = self._target_pos.unsqueeze(0).expand(len(env_ids), -1)
         noise_range = (self._joint_upper - self._joint_lower) * self.cfg.reset_noise_scale
         noise = (torch.rand_like(target) - 0.5) * 2.0 * noise_range
         sampled = torch.clamp(target + noise, self._joint_lower, self._joint_upper)
-
         joint_pos[:, self._controlled_joint_indices] = sampled
         joint_vel[:, self._controlled_joint_indices] = 0.0
-
-        default_root_state = self.robot.data.default_root_state[env_ids].clone()
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
-        default_root_state[:, 7:] = 0.0
-
-        if self._orientation_noise > 0.0:
-            noise_roll = (torch.rand(len(env_ids), device=joint_pos.device) - 0.5) * 2.0 * self._orientation_noise
-            noise_pitch = (torch.rand(len(env_ids), device=joint_pos.device) - 0.5) * 2.0 * self._orientation_noise
-            noise_yaw = torch.zeros_like(noise_roll)
-
-            delta_quat = self._euler_to_quat(noise_roll, noise_pitch, noise_yaw)
-            default_quat = default_root_state[:, 3:7]
-            new_quat = self._quat_multiply(delta_quat, default_quat)
-            default_root_state[:, 3:7] = new_quat
 
         self.joint_pos[env_ids] = joint_pos
         self.joint_vel[env_ids] = joint_vel

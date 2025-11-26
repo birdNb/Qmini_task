@@ -37,18 +37,18 @@ QMINI_ROBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.45),
+        pos=(0.0, 0.0, 0.3),  # Reference: pos=(0.0, 0.0, 0.3)
         joint_pos={
-            "LL_joint1": 0.0,
-            "LL_joint2": 0.0,
-            "LL_joint3": 0.0,
-            "LL_joint4": 0.0,
-            "LL_joint5": 0.0,
-            "RL_joint1": 0.0,
-            "RL_joint2": 0.0,
-            "RL_joint3": 0.0,
-            "RL_joint4": 0.0,
-            "RL_joint5": 0.0,
+            "LL_joint1": 0.0,   # hip_yaw
+            "LL_joint2": 0.0,   # hip_roll
+            "LL_joint3": 0.3,   # hip_pitch (Reference: 0.3)
+            "LL_joint4": -0.8,  # knee (Reference: -0.8)
+            "LL_joint5": 0.5,   # ankle (Reference: 0.5)
+            "RL_joint1": 0.0,   # hip_yaw
+            "RL_joint2": 0.0,   # hip_roll
+            "RL_joint3": 0.3,   # hip_pitch (Reference: 0.3)
+            "RL_joint4": -0.8,  # knee (Reference: -0.8)
+            "RL_joint5": 0.5,   # ankle (Reference: 0.5)
         },
     ),
     actuators={
@@ -120,10 +120,10 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 class QminiTaskEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 10.0
+    episode_length_s = 15.0
     # - spaces definition
     action_space = 10
-    observation_space = 30
+    observation_space = 42  # 42 dims: base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + velocity_commands(3) + joint_pos_rel(10) + joint_vel_rel(10) + last_action(10)
     state_space = 0
 
     # simulation
@@ -185,16 +185,16 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     )
 
     target_joint_pos = {
-        "LL_joint1": 0.0,
-        "LL_joint2": 0.0,
-        "LL_joint3": 0.0,
-        "LL_joint4": 0.0,
-        "LL_joint5": 0.0,
-        "RL_joint1": 0.0,
-        "RL_joint2": 0.0,
-        "RL_joint3": 0.0,
-        "RL_joint4": 0.0,
-        "RL_joint5": 0.0,
+        "LL_joint1": 0.0,   # hip_yaw - matches init_state
+        "LL_joint2": 0.0,   # hip_roll - matches init_state
+        "LL_joint3": 0.3,   # hip_pitch - matches init_state
+        "LL_joint4": -0.8,  # knee - matches init_state
+        "LL_joint5": 0.5,   # ankle - matches init_state
+        "RL_joint1": 0.0,   # hip_yaw - matches init_state
+        "RL_joint2": 0.0,   # hip_roll - matches init_state
+        "RL_joint3": 0.3,   # hip_pitch - matches init_state
+        "RL_joint4": -0.8,  # knee - matches init_state
+        "RL_joint5": 0.5,   # ankle - matches init_state
     }
 
     # reward scales
@@ -215,6 +215,23 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # reset 阈值
     failure_tilt_angle = math.radians(45.0)
     failure_min_height = 0.12  # [m]
+
+    # stand-up task specific parameters
+    target_base_height = 0.43  # Target height for successful stand-up [m]
+    standup_stage1_height = 0.15  # Stage 1: initial lying down (~35% of target height)
+    standup_stage2_height = 0.15  # Stage 2: intermediate (~35% of target height)
+    standup_stage3_height = 0.30  # Stage 3: near standing (~70% of target height)
+    
+    # reward scales for stand-up task
+    rew_scale_height_progress = 5.0  # Reward for height progress (increased to encourage standing up)
+    rew_scale_height_target = 10.0  # Reward for reaching target height (increased)
+    rew_scale_standup_success = 20.0  # Large reward for successful stand-up (increased)
+    
+    # initial pose sampling for stand-up
+    enable_standup_task = True  # Enable stand-up task mode
+    initial_pose_types = ["supine", "prone", "left_side", "right_side"]  # Types of initial poses
+    initial_pose_prob = [0.4, 0.3, 0.15, 0.15]  # Probability for each pose type
+    initial_height_range = (0.05, 0.15)  # Initial height range when lying down [m]
 
     # reset sampling
     reset_noise_scale = 0.1
