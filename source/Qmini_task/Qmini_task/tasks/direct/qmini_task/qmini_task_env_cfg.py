@@ -37,7 +37,7 @@ QMINI_ROBOT_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.3),  # Reference: pos=(0.0, 0.0, 0.3)
+        pos=(0.0, 0.0, 0.25),  # Reference: pos=(0.0, 0.0, 0.3)
         joint_pos={
             "LL_joint1": 0.0,   # hip_yaw
             "LL_joint2": 0.0,   # hip_roll
@@ -120,7 +120,7 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 class QminiTaskEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 15.0
+    episode_length_s = 10.0
     # - spaces definition
     action_space = 10
     observation_space = 42  # 42 dims: base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + velocity_commands(3) + joint_pos_rel(10) + joint_vel_rel(10) + last_action(10)
@@ -197,16 +197,35 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "RL_joint5": 0.5,   # ankle - matches init_state
     }
 
-    # reward scales
+    # reward scales - HoST framework
     rew_scale_alive = 0.1
     rew_scale_terminated = -1.0
-    rew_scale_joint = 1.0
-    rew_scale_joint_vel = 0.5
-    rew_scale_upright = 5.0
-    rew_scale_base_lin_vel = 0.5
-    rew_scale_base_ang_vel = 0.5
-    rew_scale_action_rate = 0.05
     rew_scale_success = 2.0
+    
+    # Task rewards (rtask)
+    rew_scale_height_task = 5.0  # Base height reward (increased to encourage reaching target height)
+    rew_scale_height_penalty = 10.0  # Height penalty when below target (strong penalty)
+    rew_scale_orientation_task = 1.0  # Body orientation reward
+    
+    # Style rewards (rstyle)
+    rew_scale_waist_penalty = 10.0  # Waist twist penalty
+    rew_scale_knee_penalty = 10.0  # Knee angle penalty
+    rew_scale_feet_distance_penalty = 10.0  # Feet distance penalty
+    rew_scale_shank_orientation = 10.0  # Shank orientation reward
+    
+    # Regularization rewards (rregu)
+    rew_scale_joint_accel = 2.5e-7  # Joint acceleration penalty
+    rew_scale_action_rate = 1e-2  # Action rate penalty
+    rew_scale_torque = 2.5e-6  # Torque penalty
+    rew_scale_power = 2.5e-5  # Power penalty
+    
+    # Post-task rewards (rpost) - only active when standing
+    rew_scale_ang_vel_post = 10.0  # Angular velocity reward when standing
+    rew_scale_lin_vel_post = 10.0  # Linear velocity reward when standing
+    rew_scale_height_post = 10.0  # Height maintenance reward when standing
+    
+    # Joint position reward (only active when height >= 0.25m)
+    rew_scale_joint = 1.0
 
     # success / failure thresholds
     success_joint_tol = 0.05

@@ -75,6 +75,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 import gymnasium as gym
 import os
 import torch
+import glob
 from datetime import datetime
 
 import omni
@@ -97,6 +98,58 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Qmini_task.tasks  # noqa: F401
+
+
+def find_latest_model_checkpoint(base_path: str) -> str:
+    """Find the latest model checkpoint in the newest timestamp directory.
+    
+    Args:
+        base_path: Base directory path (e.g., "logs/rsl_rl/qmini_stand/")
+        
+    Returns:
+        Path to the largest model_xx.pt file in the newest timestamp directory.
+    """
+    base_path = os.path.abspath(base_path)
+    if not os.path.exists(base_path):
+        raise FileNotFoundError(f"Directory not found: {base_path}")
+    
+    # Get all subdirectories (timestamp directories)
+    subdirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    if not subdirs:
+        raise FileNotFoundError(f"No subdirectories found in: {base_path}")
+    
+    # Sort by modification time (newest first)
+    subdirs_with_time = [
+        (d, os.path.getmtime(os.path.join(base_path, d))) for d in subdirs
+    ]
+    subdirs_with_time.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get the newest directory
+    newest_dir = subdirs_with_time[0][0]
+    newest_dir_path = os.path.join(base_path, newest_dir)
+    
+    # Find all model_*.pt files in the newest directory
+    model_pattern = os.path.join(newest_dir_path, "model_*.pt")
+    model_files = glob.glob(model_pattern)
+    
+    if not model_files:
+        raise FileNotFoundError(f"No model_*.pt files found in: {newest_dir_path}")
+    
+    # Extract model numbers and find the largest one
+    def extract_model_number(filepath):
+        filename = os.path.basename(filepath)
+        try:
+            # Extract number from "model_1234.pt"
+            number_str = filename.replace("model_", "").replace(".pt", "")
+            return int(number_str)
+        except ValueError:
+            return -1
+    
+    # Sort by model number (largest first)
+    model_files.sort(key=extract_model_number, reverse=True)
+    
+    return model_files[0]
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -159,7 +212,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # Default behavior: for qmini_stand, find latest model in newest timestamp directory
+        # if load_run and checkpoint are not specified
+        if (agent_cfg.experiment_name == "qmini_stand"
+                and not agent_cfg.load_run
+                and not agent_cfg.load_checkpoint):
+            try:
+                resume_path = find_latest_model_checkpoint(log_root_path)
+                print(f"[INFO] Using default checkpoint from latest directory: {resume_path}")
+            except (FileNotFoundError, ValueError) as e:
+                print(f"[WARNING] Failed to find default checkpoint: {e}")
+                print("[INFO] Falling back to get_checkpoint_path...")
+                resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -188,8 +254,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+        try:
+            # load previously trained model
+            runner.load(resume_path)
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "shape" in str(e).lower():
+                print("[ERROR]: Checkpoint dimension mismatch detected!")
+                print("[ERROR]: The checkpoint was trained with a different observation space.")
+                print(f"[ERROR]: Current observation space: {env_cfg.observation_space} dims")
+                print("[ERROR]: Please train from scratch without --resume flag, or use a compatible checkpoint.")
+                print(f"[ERROR]: Original error: {e}")
+                raise RuntimeError(
+                    "Cannot load checkpoint due to observation space mismatch. "
+                    "Please train from scratch or use a compatible checkpoint."
+                ) from e
+            else:
+                # Re-raise if it's a different error
+                raise
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
