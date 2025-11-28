@@ -200,12 +200,17 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     # reward scales - HoST framework
     rew_scale_alive = 0.1
     rew_scale_terminated = -1.0
-    rew_scale_success = 2.0
     
-    # Task rewards (rtask)
-    rew_scale_height_task = 5.0  # Base height reward (increased to encourage reaching target height)
-    rew_scale_height_penalty = 10.0  # Height penalty when below target (strong penalty)
-    rew_scale_orientation_task = 1.0  # Body orientation reward
+    # Task rewards (rtask) - added together (not multiplied to avoid gradient vanishing)
+    rew_scale_task = 1.0  # Overall task reward scale (deprecated, use individual scales)
+    rew_scale_orientation_task = 2.0  # Orientation reward scale (increased)
+    rew_scale_height_task = 5.0  # Height reward scale (increased to encourage standing)
+    target_base_height_phase1 = 0.25  # Phase 1 threshold
+    target_base_height_phase3 = 0.35  # Phase 3 threshold
+    orientation_threshold = 0.99  # Orientation threshold for tolerance
+    target_head_height = 0.43  # Target head height
+    target_head_margin = 0.43  # Head height margin (deprecated)
+    base_height_target = 0.43  # Target base height for post-task reward
     
     # Style rewards (rstyle)
     rew_scale_waist_penalty = 10.0  # Waist twist penalty
