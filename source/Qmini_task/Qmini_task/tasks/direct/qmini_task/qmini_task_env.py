@@ -249,19 +249,19 @@ class QminiTaskEnv(DirectRLEnv):
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         default_root_state[:, 7:] = 0.0  # Zero velocities
 
-        # Random rotation around X/Y axis: ±90 degrees
-        # This allows exploring different fall directions
+        # Random rotation around Y axis only: ±90 degrees (pitch)
+        # No side roll (roll = 0), only forward/backward flip
         num_envs = len(env_ids)
         device = joint_pos.device
         
-        # Random roll (rotation around X axis): ±90 degrees
-        random_roll = (torch.rand(num_envs, device=device) - 0.5) * 2.0 * math.pi / 2.0  # [-90°, +90°]
+        # No roll (rotation around X axis): always 0
+        random_roll = torch.zeros(num_envs, device=device)
         
         # Random pitch (rotation around Y axis): ±90 degrees
         random_pitch = (torch.rand(num_envs, device=device) - 0.5) * 2.0 * math.pi / 2.0  # [-90°, +90°]
         
-        # Random yaw (rotation around Z axis): full 360 degrees
-        random_yaw = torch.rand(num_envs, device=device) * 2.0 * math.pi - math.pi  # [-180°, +180°]
+        # No yaw (rotation around Z axis): always 0
+        random_yaw = torch.zeros(num_envs, device=device)
         
         # Convert to quaternion
         initial_quat = self._euler_to_quat(random_roll, random_pitch, random_yaw)

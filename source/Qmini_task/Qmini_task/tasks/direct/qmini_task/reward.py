@@ -82,18 +82,13 @@ def compute_rewards(env) -> torch.Tensor:
     pitch_deg = torch.rad2deg(pitch)
     
     # Get joint information
-    pos_error = current_pos - target_pos
-    joint_error = torch.norm(pos_error, dim=1)
-    action_rate = torch.norm(env.actions - env._prev_actions, dim=1)
-    
     # Get joint torques if available
     if hasattr(env.robot.data, 'applied_torque'):
         joint_torques = env.robot.data.applied_torque[:, env._controlled_joint_indices]
-        torque_norm = torch.norm(joint_torques, dim=1)
         # Power = torque * velocity
         power = torch.abs(torch.sum(joint_torques * current_vel, dim=1))
     else:
-        torque_norm = torch.zeros(env.scene.num_envs, device=env.device)
+        joint_torques = torch.zeros((env.scene.num_envs, len(env._controlled_joint_indices)), device=env.device)
         power = torch.zeros(env.scene.num_envs, device=env.device)
     
     # Compute joint acceleration (approximate from velocity change)
@@ -101,14 +96,12 @@ def compute_rewards(env) -> torch.Tensor:
         env._prev_joint_vel = current_vel.clone()
     joint_accel = (current_vel - env._prev_joint_vel) / env.step_dt
     env._prev_joint_vel = current_vel.clone()
-    joint_accel_norm = torch.norm(joint_accel, dim=1)
     
     # ========== Phase Detection ==========
     # Phase thresholds (adjusted for Qmini robot scale)
     phase1_threshold = env.cfg.target_base_height_phase1 if hasattr(env.cfg, 'target_base_height_phase1') else 0.25
     phase3_threshold = env.cfg.target_base_height_phase3 if hasattr(env.cfg, 'target_base_height_phase3') else 0.35
     
-    phase1_mask = (base_height < phase1_threshold).float()
     phase3_mask = (base_height >= phase3_threshold).float()
     
     # ========== Task Rewards (rtask) - ADDED (not multiplied to avoid gradient vanishing) ==========
@@ -145,10 +138,23 @@ def compute_rewards(env) -> torch.Tensor:
     )
     # Combine progressive and target rewards
     height_reward = 0.5 * height_reward_progress + 0.5 * height_reward_target
+    
+    # 3. Stand-up phase reward: extra reward for the critical stand-up phase (0.25m to 0.43m)
+    # This phase is after flipping but before fully standing
+    standup_phase_start = 0.25  # Height where stand-up phase begins
+    standup_phase_mask = (base_height >= standup_phase_start).float() * (base_height < target_head_height).float()
+    standup_phase_progress = torch.clamp(
+        (base_height - standup_phase_start) / (target_head_height - standup_phase_start),
+        0.0, 1.0
+    )
+    # Extra reward for making progress in stand-up phase
+    standup_phase_reward = standup_phase_mask * standup_phase_progress
+    rew_standup_phase = env.cfg.rew_scale_standup_phase * standup_phase_reward if hasattr(env.cfg, 'rew_scale_standup_phase') else 3.0 * standup_phase_reward
+    
     rew_height_task = env.cfg.rew_scale_height_task * height_reward
     
     # Scale task rewards
-    rew_task_total = rew_orientation_task + rew_height_task
+    rew_task_total = rew_orientation_task + rew_height_task + rew_standup_phase
     
     # ========== Style Rewards (rstyle) - ADDED ==========
     # 1. Waist deviation penalty: 1(|qwaist| > 1.4)
@@ -219,6 +225,18 @@ def compute_rewards(env) -> torch.Tensor:
     shank_orientation_reward = shank_orientation_reward * (base_height > phase1_threshold).float()
     rew_shank_orientation = env.cfg.rew_scale_shank_orientation * shank_orientation_reward
     
+    # 5. Leg extension reward: encourage straightening knees during stand-up phase
+    # Knee joints should be extended (negative values for Qmini knee joints)
+    # When standing, knees should be around -0.8 (from target_joint_pos)
+    knee_indices = [3, 8]  # LL_knee, RL_knee
+    knee_angles = current_pos[:, knee_indices]
+    target_knee_angle = -0.8  # Target knee angle from config
+    knee_extension_error = torch.abs(knee_angles - target_knee_angle)
+    knee_extension_reward = torch.exp(-5.0 * torch.mean(knee_extension_error, dim=1))
+    # Only active during stand-up phase (height >= 0.25m)
+    knee_extension_reward = knee_extension_reward * (base_height >= 0.25).float()
+    rew_knee_extension = env.cfg.rew_scale_knee_extension * knee_extension_reward if hasattr(env.cfg, 'rew_scale_knee_extension') else 2.0 * knee_extension_reward
+    
     # ========== Regularization Rewards (rregu) - ADDED ==========
     # 1. Joint acceleration penalty: ||accel||^2
     rew_joint_accel = -env.cfg.rew_scale_joint_accel * torch.sum(torch.square(joint_accel), dim=1)
@@ -262,6 +280,7 @@ def compute_rewards(env) -> torch.Tensor:
         + rew_knee_penalty
         + rew_feet_distance_penalty
         + rew_shank_orientation
+        + rew_knee_extension
         + rew_joint_accel
         + rew_action_rate
         + rew_torque

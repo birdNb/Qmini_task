@@ -11,8 +11,8 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 32
-    max_iterations = 6000
-    save_interval = 200
+    max_iterations = 10000
+    save_interval = 500
     experiment_name = "qmini_stand"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(

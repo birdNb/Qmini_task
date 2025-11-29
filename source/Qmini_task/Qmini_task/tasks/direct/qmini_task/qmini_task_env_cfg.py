@@ -205,6 +205,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_task = 1.0  # Overall task reward scale (deprecated, use individual scales)
     rew_scale_orientation_task = 2.0  # Orientation reward scale (increased)
     rew_scale_height_task = 5.0  # Height reward scale (increased to encourage standing)
+    rew_scale_standup_phase = 3.0  # Stand-up phase reward (0.25m to 0.43m) - encourages standing up after flipping
     target_base_height_phase1 = 0.25  # Phase 1 threshold
     target_base_height_phase3 = 0.35  # Phase 3 threshold
     orientation_threshold = 0.99  # Orientation threshold for tolerance
@@ -217,6 +218,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_knee_penalty = 10.0  # Knee angle penalty
     rew_scale_feet_distance_penalty = 10.0  # Feet distance penalty
     rew_scale_shank_orientation = 10.0  # Shank orientation reward
+    rew_scale_knee_extension = 2.0  # Knee extension reward during stand-up phase
     
     # Regularization rewards (rregu)
     rew_scale_joint_accel = 2.5e-7  # Joint acceleration penalty
