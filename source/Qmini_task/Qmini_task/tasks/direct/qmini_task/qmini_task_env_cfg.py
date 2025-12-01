@@ -123,8 +123,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     # - spaces definition
     action_space = 10
-    observation_space = 42  # 42 dims: base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + velocity_commands(3) + joint_pos_rel(10) + joint_vel_rel(10) + last_action(10)
+    observation_space = 37  # 37 dims: base_ang_vel(3) + projected_gravity(3) + dof_pos(10) + dof_vel(10) + last_action(10) + action_rescale(1)
     state_space = 0
+    
+    # Observation scales (following HoST design)
+    obs_scale_ang_vel = 0.25  # Base angular velocity scale
+    obs_scale_dof_pos = 1.0   # Joint position scale
+    obs_scale_dof_vel = 0.05  # Joint velocity scale
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -201,6 +206,28 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_alive = 0.1
     rew_scale_terminated = -1.0
     
+    # HoST 4-group reward weights
+    # Reward groups: task (multiplicative), regu, style, target
+    rew_weight_task = 2.5  # Task reward weight
+    rew_weight_regu = 0.1  # Regularization reward weight
+    rew_weight_style = 1.0  # Style reward weight
+    rew_weight_target = 1.0  # Post-task reward weight
+    
+    # Phase thresholds (scaled for Qmini: 0.43m is normal standing)
+    target_base_height_phase1 = 0.25  # Phase 1 threshold (scaled from 0.45m)
+    target_base_height_phase3 = 0.35  # Phase 3 threshold (scaled from 0.65m)
+    target_base_height = 0.43  # Target base height for Qmini (scaled from 0.75m)
+    target_head_height = 0.43  # Target head height relative to feet (scaled from 1.0m)
+    
+    # Curriculum learning parameters
+    enable_curriculum = True  # Enable curriculum learning
+    initial_pull_force = 20.0  # Initial upward pull force (N) - scaled from 100N
+    curriculum_force_decrement = 4.0  # Force decrement per update (scaled from 20N)
+    curriculum_head_height_threshold = 0.39  # Head height threshold for curriculum (scaled from 0.9m)
+    initial_action_rescale = 1.0  # Initial action scaling factor
+    curriculum_action_rescale_decrement = 0.02  # Action rescale decrement per update
+    min_action_rescale = 0.25  # Minimum action rescale
+    
     # Task rewards (rtask) - added together (not multiplied to avoid gradient vanishing)
     rew_scale_task = 1.0  # Overall task reward scale (deprecated, use individual scales)
     rew_scale_orientation_task = 2.0  # Orientation reward scale (increased)
@@ -209,7 +236,6 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     target_base_height_phase1 = 0.25  # Phase 1 threshold
     target_base_height_phase3 = 0.35  # Phase 3 threshold
     orientation_threshold = 0.99  # Orientation threshold for tolerance
-    target_head_height = 0.43  # Target head height
     target_head_margin = 0.43  # Head height margin (deprecated)
     base_height_target = 0.43  # Target base height for post-task reward
     

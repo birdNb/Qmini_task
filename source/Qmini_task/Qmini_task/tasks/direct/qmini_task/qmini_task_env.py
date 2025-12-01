@@ -62,6 +62,19 @@ class QminiTaskEnv(DirectRLEnv):
         self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
 
+        # Curriculum learning: upward pull force and action rescale
+        enable_curriculum = getattr(self.cfg, 'enable_curriculum', True)
+        if enable_curriculum:
+            initial_pull_force = getattr(self.cfg, 'initial_pull_force', 20.0)
+            initial_action_rescale = getattr(self.cfg, 'initial_action_rescale', 1.0)
+            self._pull_force = torch.ones(self.scene.num_envs, device=device) * initial_pull_force
+            self._action_rescale = torch.ones(self.scene.num_envs, device=device) * initial_action_rescale
+            self._old_head_height = torch.zeros(self.scene.num_envs, device=device)  # Track max head height
+        else:
+            self._pull_force = None
+            self._action_rescale = None
+            self._old_head_height = None
+
         log_dir = Path("logs/qmini_stand")
         log_dir.mkdir(parents=True, exist_ok=True)
         self._tb_writer = SummaryWriter(log_dir=str(log_dir))
@@ -130,13 +143,31 @@ class QminiTaskEnv(DirectRLEnv):
         return torch.stack((w, x, y, z), dim=1)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # Apply action rescale (curriculum learning)
+        if self._action_rescale is not None:
+            actions = actions * self._action_rescale.unsqueeze(1)
+        
+        # Calculate current episode time for each environment
+        current_time = self.episode_length_buf.float() * self.step_dt
+        free_fall_duration = 3.0  # 3 seconds of free fall
+        free_fall_mask = (current_time < free_fall_duration).float().unsqueeze(1)
+        
+        # Zero out actions during free fall period (first 3 seconds)
         raw_actions = torch.clamp(actions, -1.0, 1.0)
+        raw_actions = raw_actions * (1.0 - free_fall_mask)  # Set to 0 during free fall
+        
         gain = self._action_filter_gain
         if 0.0 < gain < 1.0:
             self._filtered_actions = self._filtered_actions + gain * (raw_actions - self._filtered_actions)
+            # Also zero out filtered actions during free fall
+            self._filtered_actions = self._filtered_actions * (1.0 - free_fall_mask)
             self.actions = self._filtered_actions
         else:
             self.actions = raw_actions
+        
+        # Note: Upward pull force application would require Isaac Lab force API
+        # For now, curriculum learning focuses on action rescale
+        # Pull force tracking is maintained for logging purposes
 
     def _apply_action(self) -> None:
         targets = self._action_mid + self._action_scale * self.actions
@@ -155,65 +186,76 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_targets = targets
 
     def _get_observations(self) -> dict:
-        """Get 42-dimensional observations following walk_policy format.
+        """Get observations following HoST framework design.
         
-        Observation breakdown:
-        1. base_lin_vel (3): Base linear velocity [vx, vy, vz]
-        2. base_ang_vel (3): Base angular velocity [ωx, ωy, ωz]
-        3. projected_gravity (3): Gravity projected in base frame
-        4. velocity_commands (3): Velocity commands [target_vx, target_vy, target_ωz] (zeros for stand-up)
-        5. joint_pos_rel (10): Joint positions relative to target
-        6. joint_vel_rel (10): Joint velocities relative to target
-        7. last_action (10): Previous action
-        Total: 42 dimensions
+        Observation breakdown (37 dimensions):
+        1. base_ang_vel (3): Base angular velocity [ωx, ωy, ωz] in base frame, scaled by 0.25
+        2. projected_gravity (3): Gravity vector projected in base frame (normalized)
+        3. dof_pos (10): Joint positions [rad], scaled by 1.0
+        4. dof_vel (10): Joint velocities [rad/s], scaled by 0.05
+        5. last_action (10): Previous action values
+        6. action_rescale (1): Action scaling factor (optional, for curriculum learning)
+        
+        Total: 37 dimensions (or 38 with action_rescale)
+        
+        Note: Following HoST design, we do NOT include base linear velocity.
         """
         root_state = self.robot.data.root_state_w
         base_quat = root_state[:, 3:7]  # [w, x, y, z]
-        base_lin_vel = root_state[:, 7:10]  # [vx, vy, vz]
         base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
         
-        # 1. base_lin_vel (3 dims) - scaled
-        obs_base_lin_vel = base_lin_vel * 0.2  # Scale down for stability
+        # Get observation scales from config
+        obs_scale_ang_vel = getattr(self.cfg, 'obs_scale_ang_vel', 0.25)
+        obs_scale_dof_pos = getattr(self.cfg, 'obs_scale_dof_pos', 1.0)
+        obs_scale_dof_vel = getattr(self.cfg, 'obs_scale_dof_vel', 0.05)
         
-        # 2. base_ang_vel (3 dims) - scaled
-        obs_base_ang_vel = base_ang_vel * 0.2
+        # 1. base_ang_vel (3 dims) - scaled by 0.25 (HoST default)
+        obs_base_ang_vel = base_ang_vel * obs_scale_ang_vel
         
-        # 3. projected_gravity (3 dims) - gravity vector in base frame
+        # 2. projected_gravity (3 dims) - gravity vector in base frame
         # Gravity in world frame: [0, 0, -1] (normalized)
         gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
         # Rotate gravity to base frame (inverse quaternion rotation)
-        # For quaternion [w, x, y, z], inverse is [w, -x, -y, -z]
         quat_inv = base_quat.clone()
         quat_inv[:, 1:4] = -quat_inv[:, 1:4]  # Negate x, y, z components
         projected_gravity = self._quat_apply(quat_inv, gravity_world)
         
-        # 4. velocity_commands (3 dims) - zeros for stand-up task
-        velocity_commands = torch.zeros((self.scene.num_envs, 3), device=self.device)
-        
-        # 5. joint_pos_rel (10 dims) - joint positions relative to target
+        # 3. dof_pos (10 dims) - joint positions, scaled by 1.0
         all_joint_pos = self.joint_pos[:, self._controlled_joint_indices]
-        all_joint_pos_rel = all_joint_pos - self._target_pos.unsqueeze(0)
+        obs_dof_pos = all_joint_pos * obs_scale_dof_pos
         
-        # 6. joint_vel_rel (10 dims) - joint velocities (already relative)
+        # 4. dof_vel (10 dims) - joint velocities, scaled by 0.05
         joint_vel = self.joint_vel[:, self._controlled_joint_indices]
-        obs_joint_vel = joint_vel * 0.05  # Scale down
+        obs_dof_vel = joint_vel * obs_scale_dof_vel
         
-        # 7. last_action (10 dims)
+        # 5. last_action (10 dims) - previous action
         obs_actions = self._prev_actions
         
-        # Concatenate all observations: 3+3+3+3+10+10+10 = 42 dims
+        # 6. action_rescale (1 dim) - action scaling factor (optional, for curriculum)
+        # Add small noise (5%) to action_rescale for exploration
+        if hasattr(self, '_action_rescale'):
+            action_rescale = self._action_rescale.unsqueeze(1)
+            noise = (torch.rand_like(action_rescale) - 0.5) * 0.05
+            obs_action_rescale = action_rescale + noise
+        else:
+            # Default to 1.0 if not using curriculum learning
+            obs_action_rescale = torch.ones((self.scene.num_envs, 1), device=self.device)
+        
+        # Concatenate all observations: 3+3+10+10+10+1 = 37 dims
         obs = torch.cat(
             (
-                obs_base_lin_vel,      # 3
                 obs_base_ang_vel,       # 3
                 projected_gravity,      # 3
-                velocity_commands,      # 3
-                all_joint_pos_rel,      # 10
-                obs_joint_vel,          # 10
+                obs_dof_pos,            # 10
+                obs_dof_vel,            # 10
                 obs_actions,            # 10
+                obs_action_rescale,     # 1
             ),
             dim=1,
         )
+        
+        # Clip observations to reasonable range (HoST uses [-100, 100])
+        obs = torch.clamp(obs, -100.0, 100.0)
         
         roll, pitch, _ = self._quat_to_euler(base_quat)
         if self._tb_step % 128 == 0:
@@ -226,7 +268,45 @@ class QminiTaskEnv(DirectRLEnv):
         total_reward = compute_rewards(self)
         self._tb_step += 1
         self._prev_actions = self.actions.clone()
+        
+        # Update curriculum learning (every N steps)
+        if self._tb_step % 250 == 0 and self._pull_force is not None:
+            self._update_curriculum()
+        
         return total_reward
+    
+    def _update_curriculum(self):
+        """Update curriculum learning: reduce pull force and action rescale based on performance."""
+        if not hasattr(self.cfg, 'enable_curriculum') or not self.cfg.enable_curriculum:
+            return
+        
+        # Get current head height (use base height as proxy)
+        root_state = self.robot.data.root_state_w
+        base_height = root_state[:, 2]
+        
+        # Update max head height
+        self._old_head_height = torch.maximum(self._old_head_height, base_height)
+        
+        # Check if head height threshold is reached
+        threshold = getattr(self.cfg, 'curriculum_head_height_threshold', 0.39)
+        force_decrement = getattr(self.cfg, 'curriculum_force_decrement', 4.0)
+        action_rescale_decrement = getattr(self.cfg, 'curriculum_action_rescale_decrement', 0.02)
+        min_action_rescale = getattr(self.cfg, 'min_action_rescale', 0.25)
+        
+        # Update for environments that reached threshold
+        update_mask = (self._old_head_height > threshold).float()
+        
+        # Decrease pull force
+        self._pull_force = (self._pull_force - force_decrement * update_mask).clamp(0.0, None)
+        
+        # Decrease action rescale
+        self._action_rescale = (self._action_rescale - action_rescale_decrement * update_mask).clamp(min_action_rescale, None)
+        
+        # Log curriculum progress
+        if self._tb_step % 250 == 0:
+            self._tb_writer.add_scalar("curriculum/pull_force", self._pull_force.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("curriculum/action_rescale", self._action_rescale.mean().item(), self._tb_step)
+            self._tb_writer.add_scalar("curriculum/max_head_height", self._old_head_height.mean().item(), self._tb_step)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self.joint_pos = self.robot.data.joint_pos
@@ -285,6 +365,10 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._filtered_actions[env_ids] = 0.0
         self._prev_targets[env_ids] = joint_pos[:, self._controlled_joint_indices]
+        
+        # Reset curriculum tracking
+        if self._old_head_height is not None:
+            self._old_head_height[env_ids] = 0.0
 
     @staticmethod
     def _quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
