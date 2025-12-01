@@ -329,22 +329,21 @@ class QminiTaskEnv(DirectRLEnv):
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         default_root_state[:, 7:] = 0.0  # Zero velocities
 
-        # Random rotation around Y axis only: ±90 degrees (pitch)
-        # No side roll (roll = 0), only forward/backward flip
+        # Setup姿态：向前倒下，绕Y轴旋转+90度
         num_envs = len(env_ids)
         device = joint_pos.device
         
-        # No roll (rotation around X axis): always 0
-        random_roll = torch.zeros(num_envs, device=device)
+        # Roll (rotation around X axis): always 0
+        roll = torch.zeros(num_envs, device=device)
         
-        # Random pitch (rotation around Y axis): ±90 degrees
-        random_pitch = (torch.rand(num_envs, device=device) - 0.5) * 2.0 * math.pi / 2.0  # [-90°, +90°]
+        # Pitch (rotation around Y axis): +90 degrees (向前倒下，脸朝下)
+        pitch = torch.ones(num_envs, device=device) * (math.pi / 2.0)  # +90 degrees
         
-        # No yaw (rotation around Z axis): always 0
-        random_yaw = torch.zeros(num_envs, device=device)
+        # Yaw (rotation around Z axis): always 0
+        yaw = torch.zeros(num_envs, device=device)
         
         # Convert to quaternion
-        initial_quat = self._euler_to_quat(random_roll, random_pitch, random_yaw)
+        initial_quat = self._euler_to_quat(roll, pitch, yaw)
         default_root_state[:, 3:7] = initial_quat
         
         # Set joints to target position with noise

@@ -95,6 +95,10 @@ def compute_rewards(env) -> torch.Tensor:
     quat_inv[:, 1:4] = -quat_inv[:, 1:4]
     projected_gravity = env._quat_apply(quat_inv, gravity_world)
     
+    # Compute pitch angle for penalty
+    roll, pitch, yaw = env._quat_to_euler(base_quat)
+    pitch_deg = torch.rad2deg(pitch)
+    
     # Phase detection (scaled for Qmini: 0.43m is normal standing height)
     phase1_threshold = getattr(env.cfg, 'target_base_height_phase1', 0.25)  # 0.25m (scaled from 0.45m)
     phase3_threshold = getattr(env.cfg, 'target_base_height_phase3', 0.35)  # 0.35m (scaled from 0.65m)
@@ -194,6 +198,13 @@ def compute_rewards(env) -> torch.Tensor:
         dim=1
     )
     rew_regu += -1.0 * vel_limits_violation
+    
+    # 9. Pitch deviation penalty (增大pitch偏离的惩罚)
+    # Penalize pitch deviation from 0 (upright)
+    pitch_penalty_scale = getattr(env.cfg, 'rew_scale_pitch_penalty', 5.0)  # Increased from default
+    pitch_error_deg = torch.abs(pitch_deg)
+    # Use exponential penalty: stronger penalty for larger deviations
+    rew_regu += -pitch_penalty_scale * torch.exp(pitch_error_deg / 10.0)  # Exponential penalty
     
     # ========== STYLE REWARDS (Additive) ==========
     rew_style = torch.zeros(env.scene.num_envs, device=env.device)
@@ -311,6 +322,7 @@ def compute_rewards(env) -> torch.Tensor:
         env._tb_writer.add_scalar("reward/total", total_reward.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/base_height", base_height.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/head_height_rel", head_height_rel.mean().item(), env._tb_step)
+        env._tb_writer.add_scalar("debug/pitch_deg", pitch_deg.mean().item(), env._tb_step)
         env._tb_writer.add_scalar("debug/phase3_mask", phase3_mask.mean().item(), env._tb_step)
     
     return total_reward

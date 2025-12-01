@@ -213,6 +213,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_weight_style = 1.0  # Style reward weight
     rew_weight_target = 1.0  # Post-task reward weight
     
+    # Pitch deviation penalty (in regu group)
+    rew_scale_pitch_penalty = 5.0  # Pitch deviation penalty scale (增大pitch偏离的惩罚)
+    
     # Phase thresholds (scaled for Qmini: 0.43m is normal standing)
     target_base_height_phase1 = 0.25  # Phase 1 threshold (scaled from 0.45m)
     target_base_height_phase3 = 0.35  # Phase 3 threshold (scaled from 0.65m)
