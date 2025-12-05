@@ -61,6 +61,9 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
+        
+        # Reset timer: track time since last reset for each environment
+        self._reset_timer = torch.zeros(self.scene.num_envs, device=device)
 
         # Curriculum learning: upward pull force and action rescale
         enable_curriculum = getattr(self.cfg, 'enable_curriculum', True)
@@ -143,24 +146,26 @@ class QminiTaskEnv(DirectRLEnv):
         return torch.stack((w, x, y, z), dim=1)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # Update reset timer
+        self._reset_timer += self.step_dt
+        
         # Apply action rescale (curriculum learning)
         if self._action_rescale is not None:
             actions = actions * self._action_rescale.unsqueeze(1)
         
-        # Calculate current episode time for each environment
-        current_time = self.episode_length_buf.float() * self.step_dt
-        free_fall_duration = 3.0  # 3 seconds of free fall
-        free_fall_mask = (current_time < free_fall_duration).float().unsqueeze(1)
+        # Zero out actions during first 2 seconds after reset
+        no_action_duration = 2.0  # 2 seconds after reset
+        no_action_mask = (self._reset_timer < no_action_duration).float().unsqueeze(1)
         
-        # Zero out actions during free fall period (first 3 seconds)
+        # Zero out actions during first 2 seconds after reset
         raw_actions = torch.clamp(actions, -1.0, 1.0)
-        raw_actions = raw_actions * (1.0 - free_fall_mask)  # Set to 0 during free fall
+        raw_actions = raw_actions * (1.0 - no_action_mask)  # Set to 0 during first 2 seconds
         
         gain = self._action_filter_gain
         if 0.0 < gain < 1.0:
             self._filtered_actions = self._filtered_actions + gain * (raw_actions - self._filtered_actions)
-            # Also zero out filtered actions during free fall
-            self._filtered_actions = self._filtered_actions * (1.0 - free_fall_mask)
+            # Also zero out filtered actions during first 2 seconds after reset
+            self._filtered_actions = self._filtered_actions * (1.0 - no_action_mask)
             self.actions = self._filtered_actions
         else:
             self.actions = raw_actions
@@ -329,17 +334,17 @@ class QminiTaskEnv(DirectRLEnv):
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         default_root_state[:, 7:] = 0.0  # Zero velocities
 
-        # Setup姿态：向前倒下，绕Y轴旋转+90度
+        # Setup姿态：正常姿态，不旋转
         num_envs = len(env_ids)
         device = joint_pos.device
         
-        # Roll (rotation around X axis): always 0
+        # Roll (rotation around X axis): 0
         roll = torch.zeros(num_envs, device=device)
         
-        # Pitch (rotation around Y axis): +90 degrees (向前倒下，脸朝下)
-        pitch = torch.ones(num_envs, device=device) * (math.pi / 2.0)  # +90 degrees
+        # Pitch (rotation around Y axis): 0 (正常姿态)
+        pitch = torch.zeros(num_envs, device=device)
         
-        # Yaw (rotation around Z axis): always 0
+        # Yaw (rotation around Z axis): 0
         yaw = torch.zeros(num_envs, device=device)
         
         # Convert to quaternion
@@ -364,6 +369,9 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_actions[env_ids] = 0.0
         self._filtered_actions[env_ids] = 0.0
         self._prev_targets[env_ids] = joint_pos[:, self._controlled_joint_indices]
+        
+        # Reset timer for reset environments
+        self._reset_timer[env_ids] = 0.0
         
         # Reset curriculum tracking
         if self._old_head_height is not None:

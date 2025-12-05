@@ -181,15 +181,17 @@ def compute_rewards(env) -> torch.Tensor:
     joint_tracking_error = torch.sum(torch.square(target_pos - current_pos), dim=1)
     rew_regu += -0.00025 * joint_tracking_error
     
-    # 7. Joint position limits penalty
-    joint_lower = env._joint_lower.unsqueeze(0).expand_as(current_pos)
-    joint_upper = env._joint_upper.unsqueeze(0).expand_as(current_pos)
-    pos_limits_violation = torch.sum(
-        torch.clamp(joint_lower - current_pos, 0.0, None) ** 2
-        + torch.clamp(current_pos - joint_upper, 0.0, None) ** 2,
-        dim=1
-    )
-    rew_regu += -100.0 * pos_limits_violation  # Large penalty
+    # 7. Joint position limits penalty (disabled by default)
+    enable_joint_pos_limits = getattr(env.cfg, 'enable_joint_pos_limits_penalty', False)
+    if enable_joint_pos_limits:
+        joint_lower = env._joint_lower.unsqueeze(0).expand_as(current_pos)
+        joint_upper = env._joint_upper.unsqueeze(0).expand_as(current_pos)
+        pos_limits_violation = torch.sum(
+            torch.clamp(joint_lower - current_pos, 0.0, None) ** 2
+            + torch.clamp(current_pos - joint_upper, 0.0, None) ** 2,
+            dim=1
+        )
+        rew_regu += -100.0 * pos_limits_violation  # Large penalty
     
     # 8. Joint velocity limits penalty (check if velocity exceeds reasonable limits)
     max_vel_limit = getattr(env.cfg, 'max_joint_velocity', 5.0)

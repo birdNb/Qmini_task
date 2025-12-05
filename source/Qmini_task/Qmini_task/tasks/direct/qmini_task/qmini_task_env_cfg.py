@@ -120,7 +120,7 @@ QMINI_ROBOT_CFG = ArticulationCfg(
 class QminiTaskEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 10.0
+    episode_length_s = 18.0
     # - spaces definition
     action_space = 10
     observation_space = 37  # 37 dims: base_ang_vel(3) + projected_gravity(3) + dof_pos(10) + dof_vel(10) + last_action(10) + action_rescale(1)
@@ -215,6 +215,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     
     # Pitch deviation penalty (in regu group)
     rew_scale_pitch_penalty = 5.0  # Pitch deviation penalty scale (增大pitch偏离的惩罚)
+    
+    # Joint limits penalty control
+    enable_joint_pos_limits_penalty = False  # 关闭关节位置限位惩罚
     
     # Phase thresholds (scaled for Qmini: 0.43m is normal standing)
     target_base_height_phase1 = 0.25  # Phase 1 threshold (scaled from 0.45m)
