@@ -50,8 +50,17 @@ class QminiTaskEnv(DirectRLEnv):
             [self.cfg.target_joint_pos[name] for name in self._controlled_joint_names],
             device=device,
         )
+        # Reference joint positions for observation (standing pose)
+        self._ref_joint_act = torch.tensor(
+            [self.cfg.ref_joint_act[name] for name in self._controlled_joint_names],
+            device=device,
+        )
         self._action_mid = (self._joint_upper + self._joint_lower) * 0.5
         self._action_scale = (self._joint_upper - self._joint_lower) * 0.5
+        
+        # Action increment ranges (for 12-dim action: 2 freq + 10 joint increments)
+        self._act_inc_high = torch.tensor(self.cfg.act_inc_high, device=device)
+        self._act_inc_low = torch.tensor(self.cfg.act_inc_low, device=device)
 
         self._upright_axis = torch.tensor([0.0, 0.0, 1.0], device=device)
         self._min_height = self.cfg.failure_min_height
@@ -60,8 +69,9 @@ class QminiTaskEnv(DirectRLEnv):
         self._failure_pitch_angle = float(self.cfg.failure_pitch_angle)
 
         self._action_filter_gain = float(self.cfg.action_filter_gain)
-        self._prev_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
-        self._filtered_actions = torch.zeros((self.scene.num_envs, self._num_dofs), device=device)
+        # For 12-dim action: 2 freq + 10 joint increments
+        self._prev_actions = torch.zeros((self.scene.num_envs, 12), device=device)
+        self._filtered_actions = torch.zeros((self.scene.num_envs, 12), device=device)
         self._prev_targets = self._target_pos.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
 
         # Joint indices for grouped observations
@@ -108,6 +118,18 @@ class QminiTaskEnv(DirectRLEnv):
         self._gait_phase = torch.zeros(self.scene.num_envs, device=device)
         cycle = max(self.cfg.gait_cycle_duration, 1e-6)
         self._gait_phase_rate = 2.0 * math.pi / cycle
+        
+        # Phase and frequency tracking for ONNX model (2 legs)
+        self._pm_phase = torch.zeros((self.scene.num_envs, 2), device=device)  # [left_phase, right_phase]
+        self._pm_f = torch.ones((self.scene.num_envs, 2), device=device) * 1.0  # [left_freq, right_freq] in Hz
+        # Current joint target positions (for position error calculation)
+        self._joint_act = self._ref_joint_act.unsqueeze(0).expand(self.scene.num_envs, -1).clone()
+
+        # Observation history buffer for 3-frame stacking (43 dims × 3 frames = 129 dims)
+        self._num_stacks = getattr(self.cfg, "num_stacks", 3)
+        self._obs_history = torch.zeros(
+            (self.scene.num_envs, self._num_stacks, 43), device=device
+        )  # [N, 3, 43]
         self._control_dt = self.step_dt
         self._joint_target_speed = getattr(self.cfg, "joint_target_speed", 1.0)
         self._joint_speed_scale = getattr(self.cfg, "rew_scale_joint_speed", 0.0)
@@ -415,14 +437,77 @@ class QminiTaskEnv(DirectRLEnv):
 
         self.visualization_markers.visualize(positions, rotations, marker_indices=marker_ids)
 
+    def _transform_action(self, raw_action: torch.Tensor) -> torch.Tensor:
+        """Transform action from [-1, 1] to actual ranges.
+        
+        Args:
+            raw_action: [N, 12] tensor with values in [-1, 1]
+            
+        Returns:
+            transformed_action: [N, 12] tensor with:
+                [0:2]: phase frequencies in [0.5, 3.5] Hz
+                [2:12]: joint increments in [-15.0, 15.0] rad/s
+        """
+        # Normalize from [-1, 1] to [0, 1]
+        net = (raw_action + 1.0) / 2.0
+        
+        # Transform to actual ranges
+        transformed = torch.zeros_like(raw_action)
+        
+        # [0:2] Phase frequencies: [0.5, 3.5] Hz
+        freq_high = self._act_inc_high[0]
+        freq_low = self._act_inc_low[0]
+        transformed[:, 0:2] = net[:, 0:2] * (freq_high - freq_low) + freq_low
+        
+        # [2:12] Joint increments: [-15.0, 15.0] rad/s
+        joint_high = self._act_inc_high[1]
+        joint_low = self._act_inc_low[1]
+        transformed[:, 2:12] = net[:, 2:12] * (joint_high - joint_low) + joint_low
+        
+        return transformed
+    
+    def _update_phase_and_frequency(self, action_increment: torch.Tensor) -> None:
+        """Update phase and frequency based on action increments.
+        
+        Args:
+            action_increment: [N, 12] tensor with transformed actions
+        """
+        # Update phase frequencies (first 2 dims)
+        self._pm_f = action_increment[:, 0:2]  # [N, 2]
+        
+        # Update phases based on frequencies
+        # Phase increment = frequency * 2π * dt
+        phase_increment = self._pm_f * 2.0 * math.pi * self.step_dt
+        self._pm_phase = (self._pm_phase + phase_increment) % (2.0 * math.pi)
+    
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # Actions should be 12-dim: [2 freq + 10 joint increments]
         raw_actions = torch.clamp(actions, -1.0, 1.0)
         gain = self._action_filter_gain
         if 0.0 < gain < 1.0:
             self._filtered_actions = self._filtered_actions + gain * (raw_actions - self._filtered_actions)
-            self.actions = self._filtered_actions
+            filtered_raw = self._filtered_actions
         else:
-            self.actions = raw_actions
+            filtered_raw = raw_actions
+        
+        # Transform actions from [-1, 1] to actual ranges
+        action_increment = self._transform_action(filtered_raw)
+        self.actions = action_increment  # Store transformed actions for observation
+        
+        # Update phase and frequency
+        self._update_phase_and_frequency(action_increment)
+        
+        # Update joint target positions based on increments
+        # joint_act += increment * dt
+        joint_increments = action_increment[:, 2:12]  # [N, 10]
+        self._joint_act = self._joint_act + joint_increments * self.step_dt
+        
+        # Clamp joint_act to joint limits
+        self._joint_act = torch.clamp(
+            self._joint_act,
+            self._joint_lower.unsqueeze(0),
+            self._joint_upper.unsqueeze(0)
+        )
 
         if self._command_change_interval > 0.0:
             self._command_timer += self.step_dt
@@ -430,10 +515,14 @@ class QminiTaskEnv(DirectRLEnv):
             if env_ids.numel() > 0:
                 self._sample_commands(env_ids)
 
+        # Keep legacy gait_phase for compatibility (if needed)
         self._gait_phase = (self._gait_phase + self._gait_phase_rate * self.step_dt) % (2.0 * math.pi)
 
     def _apply_action(self) -> None:
-        targets = self._action_mid + self._action_scale * self.actions
+        # Use joint_act as targets (already updated in _pre_physics_step)
+        targets = self._joint_act.clone()
+        
+        # Apply smoothing if configured
         smoothing = max(0.0, min(1.0, float(self.cfg.action_smoothing_rate)))
         if smoothing > 0.0:
             targets = self._prev_targets + smoothing * (targets - self._prev_targets)
@@ -460,81 +549,137 @@ class QminiTaskEnv(DirectRLEnv):
         self.robot.set_joint_position_target(targets, joint_ids=self._controlled_joint_indices)
         self._prev_targets = targets
 
-    def _get_observations(self) -> dict:
-        """Get 42-dimensional observations following the reference implementation.
+    def _get_single_frame_observation(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Get single 43-dimensional observation frame.
 
-        Observation breakdown:
-        1. base_lin_vel (3): Base linear velocity [vx, vy, vz]
-        2. base_ang_vel (3): Base angular velocity [ωx, ωy, ωz]
-        3. projected_gravity (3): Gravity projected in base frame
-        4. velocity_commands (3): Velocity commands [target_vx, target_vy, target_ωz]
-        5. hip_pos (2): HR joint positions relative to target (joint1)
-        6. kfe_pos (6): HAA+HFE+KFE joint positions relative to target (joint2,3,4)
-        7. ffe_pos (2): FFE joint positions relative to target (joint5)
-        8. joint_vel (10): All joint velocities relative to target
-        9. actions (10): Previous action
-        Total: 42 dimensions
+        Args:
+            env_ids: Optional tensor of environment indices. If None, uses all environments.
+
+        Returns:
+            obs: [N, 43] tensor with single frame observation
         """
+        if env_ids is None:
+            env_ids = slice(None)
+            num_envs = self.scene.num_envs
+            use_slice = True
+        else:
+            num_envs = len(env_ids) if isinstance(env_ids, torch.Tensor) else len(env_ids)
+            use_slice = False
+
         root_state = self.robot.data.root_state_w
-        base_quat = root_state[:, 3:7]  # [w, x, y, z]
-        # NOTE: base_lin_vel is NOT in Policy observations (only in Critic)
-        base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
+        if use_slice:
+            base_quat = root_state[:, 3:7]  # [w, x, y, z]
+            base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
+        else:
+            base_quat = root_state[env_ids, 3:7]  # [w, x, y, z]
+            base_ang_vel = root_state[env_ids, 10:13]  # [ωx, ωy, ωz]
 
-        # 1. base_ang_vel (3 dims) - Reference: scale=0.2, noise=(-0.2, 0.2)
-        # NOTE: Policy observation does NOT include base_lin_vel (only Critic has it)
-        base_ang_vel_noise = torch.rand_like(base_ang_vel) * 0.4 - 0.2
-        obs_base_ang_vel = base_ang_vel * 0.2 + base_ang_vel_noise  # Reference: scale=0.2
+        # Convert quaternion to Euler angles (roll, pitch, yaw)
+        roll, pitch, yaw = self._quat_to_euler(base_quat)
 
-        # 2. projected_gravity (3 dims) - Reference: noise=(-0.05, 0.05)
-        # Gravity in world frame: [0, 0, -1] (normalized)
-        gravity_world = torch.tensor([0.0, 0.0, -1.0], device=self.device).unsqueeze(0).expand(self.scene.num_envs, -1)
-        # Rotate gravity to base frame using quaternion
-        projected_gravity = math_utils.quat_apply_inverse(base_quat, gravity_world)
-        projected_gravity_noise = torch.rand_like(projected_gravity) * 0.1 - 0.05  # Reference: noise=(-0.05, 0.05)
-        obs_projected_gravity = projected_gravity + projected_gravity_noise
+        # 1. [0:2] target_command (2 dims): vx_cmd, yr_cmd
+        target_command = torch.zeros((num_envs, 2), device=self.device)
+        if use_slice:
+            cmd_slice = self._command
+        else:
+            cmd_slice = self._command[env_ids]
+        target_command[:, 0] = cmd_slice[:, 0]  # vx
+        target_command[:, 1] = cmd_slice[:, 2]  # yr (yaw rate)
 
-        # 3. velocity_commands (3 dims) - [target_vx, target_vy, target_ωz]
-        # Convert command from [vx, vy, yaw] to [vx, vy, ωz]
-        velocity_commands = torch.zeros((self.scene.num_envs, 3), device=self.device)
-        velocity_commands[:, 0] = self._command[:, 0]  # vx
-        velocity_commands[:, 1] = self._command[:, 1]  # vy
-        velocity_commands[:, 2] = self._command[:, 2]  # yaw (used as ωz)
+        # 2. [2:4] base_rpy (2 dims): roll, pitch
+        base_rpy = torch.stack([roll, pitch], dim=1)
 
-        # 4. joint_pos_rel (10 dims) - Reference: noise=(-0.01, 0.01)
-        all_joint_pos = self.joint_pos[:, self._controlled_joint_indices]
-        all_joint_pos_rel = all_joint_pos - self._target_pos.unsqueeze(0)
-        joint_pos_noise = torch.rand_like(all_joint_pos_rel) * 0.02 - 0.01  # Reference: noise=(-0.01, 0.01)
-        obs_joint_pos_rel = all_joint_pos_rel + joint_pos_noise
+        # 3. [4:7] base_rpy_rate (3 dims): roll_rate*0.5, pitch_rate*0.5, yaw_rate*0.5
+        base_rpy_rate = base_ang_vel * 0.5
 
-        # 5. joint_vel_rel (10 dims) - Reference: scale=0.05, noise=(-1.5, 1.5)
-        joint_vel = self.joint_vel[:, self._controlled_joint_indices]
-        joint_vel_noise = torch.rand_like(joint_vel) * 3.0 - 1.5  # Reference: noise=(-1.5, 1.5)
-        obs_joint_vel = joint_vel * 0.05 + joint_vel_noise  # Reference: scale=0.05
+        # 4. [7:17] joint_pos_deviation (10 dims): joint_pos[i] - ref_joint_act[i]
+        if use_slice:
+            joint_pos_all = self.joint_pos  # [N, num_joints]
+        else:
+            joint_pos_all = self.joint_pos[env_ids]  # [len(env_ids), num_joints]
+        joint_pos_slice = joint_pos_all[:, self._controlled_joint_indices]  # [N, 10]
+        joint_pos_deviation = joint_pos_slice - self._ref_joint_act.unsqueeze(0)
 
-        # 6. last_action (10 dims) - Reference: last_action
-        obs_actions = self._prev_actions
+        # 5. [17:27] joint_vel (10 dims): joint_vel[i] * 0.1
+        if use_slice:
+            joint_vel_all = self.joint_vel  # [N, num_joints]
+        else:
+            joint_vel_all = self.joint_vel[env_ids]  # [len(env_ids), num_joints]
+        joint_vel_slice = joint_vel_all[:, self._controlled_joint_indices]  # [N, 10]
+        joint_vel = joint_vel_slice * 0.1
 
-        # 7. gait_phase (1 dim) - Reference: gait_phase, period=0.6
-        gait_phase_normalized = (self._gait_phase / (2.0 * math.pi)) % 1.0  # Normalize to [0, 1)
-        obs_gait_phase = gait_phase_normalized.unsqueeze(1)  # [N, 1]
+        # 6. [27:37] joint_pos_error (10 dims): joint_act[i] - joint_pos[i]
+        if use_slice:
+            joint_act_slice = self._joint_act
+        else:
+            joint_act_slice = self._joint_act[env_ids]
+        joint_pos_error = joint_act_slice - joint_pos_slice
 
-        # Concatenate all observations: 3+3+3+10+10+10+1 = 40 dims (Reference: no base_lin_vel in Policy)
-        # Order matches reference: base_ang_vel, projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel, last_action, gait_phase
+        # 7. [37:41] phase_info (4 dims): sin/cos left phase, sin/cos right phase
+        cmd_speed = torch.norm(target_command, dim=1)
+        static_flag = (cmd_speed >= 0.15).float().unsqueeze(1)  # [N, 1]
+
+        if use_slice:
+            phase_left_slice = self._pm_phase[:, 0:1]
+            phase_right_slice = self._pm_phase[:, 1:2]
+        else:
+            phase_left_slice = self._pm_phase[env_ids, 0:1]
+            phase_right_slice = self._pm_phase[env_ids, 1:2]
+        phase_info = torch.cat([
+            torch.sin(phase_left_slice) * static_flag,
+            torch.cos(phase_left_slice) * static_flag,
+            torch.sin(phase_right_slice) * static_flag,
+            torch.cos(phase_right_slice) * static_flag,
+        ], dim=1)  # [N, 4]
+
+        # 8. [41:43] frequency_info (2 dims): left freq, right freq
+        if use_slice:
+            pm_f_slice = self._pm_f
+        else:
+            pm_f_slice = self._pm_f[env_ids]
+        freq_info = (pm_f_slice * 0.3 - 1.0) * static_flag  # [N, 2]
+
+        # Concatenate all observations: 2+2+3+10+10+10+4+2 = 43 dims
         obs = torch.cat(
             (
-                obs_base_ang_vel,       # 3 (Reference: base_ang_vel)
-                obs_projected_gravity,  # 3 (Reference: projected_gravity)
-                velocity_commands,      # 3 (Reference: velocity_commands)
-                obs_joint_pos_rel,      # 10 (Reference: joint_pos_rel)
-                obs_joint_vel,          # 10 (Reference: joint_vel_rel)
-                obs_actions,            # 10 (Reference: last_action)
-                obs_gait_phase,         # 1 (Reference: gait_phase)
+                target_command,       # 2: [0:2]
+                base_rpy,             # 2: [2:4]
+                base_rpy_rate,        # 3: [4:7]
+                joint_pos_deviation,  # 10: [7:17]
+                joint_vel,            # 10: [17:27]
+                joint_pos_error,      # 10: [27:37]
+                phase_info,           # 4: [37:41]
+                freq_info,            # 2: [41:43]
             ),
             dim=1,
         )
 
+        # Clip observations to [-3, 3] range
+        obs = torch.clamp(obs, -3.0, 3.0)
+
+        return obs
+
+    def _get_observations(self) -> dict:
+        """Get 129-dimensional observations (43 dims × 3 frames) following ONNX model specification.
+
+        Observation breakdown:
+        - Single frame (43 dims): target_command(2) + base_rpy(2) + base_rpy_rate(3) +
+          joint_pos_deviation(10) + joint_vel(10) + joint_pos_error(10) + phase_info(4) + frequency_info(2)
+        - Stacked frames (129 dims): [obs_t-2, obs_t-1, obs_t] - 3 frames of 43 dims each
+        """
+        # Get current single frame observation
+        obs = self._get_single_frame_observation()
+        
+        # Update observation history (sliding window)
+        # Shift history: remove oldest frame, add current frame
+        self._obs_history[:, :-1] = self._obs_history[:, 1:].clone()  # Shift left
+        self._obs_history[:, -1] = obs  # Add current observation
+        
+        # Stack 3 frames: [obs_t-2, obs_t-1, obs_t] -> [N, 129]
+        obs_stacked = self._obs_history.view(self.scene.num_envs, -1)  # [N, 3*43] = [N, 129]
+
         self._visualize_markers()
-        return {"policy": obs}
+        return {"policy": obs_stacked}
 
     def _get_rewards(self) -> torch.Tensor:
         """Delegates reward computation to reward.py for better modularity."""
@@ -621,6 +766,27 @@ class QminiTaskEnv(DirectRLEnv):
         if self._prev_joint_vel is None:
             self._prev_joint_vel = torch.zeros((self.scene.num_envs, self._num_dofs), device=self.device)
         self._prev_joint_vel[env_ids] = joint_vel[:, self._controlled_joint_indices]
+        
+        # Initialize phase and frequency for ONNX model
+        self._pm_phase[env_ids] = torch.rand(len(env_ids), 2, device=self.device) * 2.0 * math.pi  # Random initial phase
+        self._pm_f[env_ids] = torch.ones(len(env_ids), 2, device=self.device) * 1.0  # Initial frequency: 1.0 Hz
+        # Initialize joint_act to reference positions
+        self._joint_act[env_ids] = self._ref_joint_act.unsqueeze(0).expand(len(env_ids), -1)
+        
+        # Initialize observation history buffer (fill with current observation)
+        # Get initial observation to fill history
+        if isinstance(env_ids, torch.Tensor):
+            initial_obs = self._get_single_frame_observation(env_ids)
+            for i in range(self._num_stacks):
+                self._obs_history[env_ids, i] = initial_obs
+        else:
+            # For slice or all environments
+            initial_obs = self._get_single_frame_observation(env_ids)
+            if isinstance(env_ids, slice):
+                self._obs_history[env_ids, :] = initial_obs.unsqueeze(1).expand(-1, self._num_stacks, -1)
+            else:
+                for i in range(self._num_stacks):
+                    self._obs_history[env_ids, i] = initial_obs
 
     @staticmethod
     def _quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:

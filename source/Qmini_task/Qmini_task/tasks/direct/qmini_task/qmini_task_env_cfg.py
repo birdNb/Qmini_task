@@ -123,8 +123,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     decimation = 4  # Reference: 4 (increased from 2)
     episode_length_s = 30.0  # Reference: 20.0 (increased from 10.0)
     # - spaces definition
-    action_space = 10
-    observation_space = 40  # Reference: 3+3+3+10+10+10+1 = 40 (base_ang_vel, projected_gravity, velocity_commands, joint_pos_rel, joint_vel_rel, last_action, gait_phase)
+    action_space = 12  # 2维相位频率 + 10维关节增量
+    observation_space = 129  # 43维单帧观测 × 3帧历史堆叠 = 129维
+    num_stacks = 3  # 历史帧堆叠数量
     state_space = 0
 
     # simulation - Following reference configuration
@@ -200,6 +201,24 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
         "RL_joint4": -0.2,  # Knee joint target: -0.8 (Reference: -0.8)
         "RL_joint5": 0.0,
     }
+
+    # Reference joint positions for observation (standing pose reference)
+    ref_joint_act = {
+        "LL_joint1": 0.0,
+        "LL_joint2": 0.0,
+        "LL_joint3": 0.3,   # Reference standing pose
+        "LL_joint4": -0.8,  # Reference standing pose
+        "LL_joint5": 0.5,   # Reference standing pose
+        "RL_joint1": 0.0,
+        "RL_joint2": 0.0,
+        "RL_joint3": 0.3,   # Reference standing pose
+        "RL_joint4": -0.8,  # Reference standing pose
+        "RL_joint5": 0.5,   # Reference standing pose
+    }
+
+    # Action increment ranges (for 12-dim action: 2 freq + 10 joint increments)
+    act_inc_high = [3.5, 15.0]  # [频率上限(Hz), 关节增量上限(rad/s)]
+    act_inc_low = [0.5, -15.0]  # [频率下限(Hz), 关节增量下限(rad/s)]
 
     # reward scales - Adjusted to prevent jumping and ensure reasonable reward values
     # 1. Task Rewards - Scaled down by 1000x to target ~10 reward at convergence

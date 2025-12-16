@@ -12,8 +12,8 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 class QminiRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # G1 style training configuration
     num_steps_per_env = 48  # Steps per environment per rollout
-    max_iterations = 2100
-    save_interval = 300
+    max_iterations = 21000
+    save_interval = 1000
     experiment_name = "qmini_rough"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
