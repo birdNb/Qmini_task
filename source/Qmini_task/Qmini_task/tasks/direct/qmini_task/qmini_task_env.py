@@ -316,14 +316,14 @@ class QminiTaskEnv(DirectRLEnv):
             return
 
         # Use fixed command ranges (no curriculum)
+        # Only 2D control: forward/backward (vx) and turning (yaw)
         x_min, x_max = self.cfg.command_lin_vel_x_range
-        y_min, y_max = self.cfg.command_lin_vel_y_range
         yaw_min, yaw_max = self.cfg.command_yaw_range
 
-        rand_vals = torch.rand((env_ids_t.numel(), 3), device=self.device)
-        self._command[env_ids_t, 0] = x_min + (x_max - x_min) * rand_vals[:, 0]
-        self._command[env_ids_t, 1] = y_min + (y_max - y_min) * rand_vals[:, 1]
-        self._command[env_ids_t, 2] = yaw_min + (yaw_max - yaw_min) * rand_vals[:, 2]
+        rand_vals = torch.rand((env_ids_t.numel(), 2), device=self.device)
+        self._command[env_ids_t, 0] = x_min + (x_max - x_min) * rand_vals[:, 0]  # vx: forward/backward
+        self._command[env_ids_t, 1] = 0.0  # vy: always 0 (no lateral movement)
+        self._command[env_ids_t, 2] = yaw_min + (yaw_max - yaw_min) * rand_vals[:, 1]  # yaw: turning
 
         self._command_timer[env_ids_t] = 0.0
         self._gait_phase[env_ids_t] = torch.rand(env_ids_t.numel(), device=self.device) * 2.0 * math.pi
@@ -550,7 +550,17 @@ class QminiTaskEnv(DirectRLEnv):
         self._prev_targets = targets
 
     def _get_single_frame_observation(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Get single 43-dimensional observation frame.
+        """Get single 43-dimensional observation frame following ONNX model specification.
+
+        Observation breakdown (43 dims):
+        1. [0:2] target_command (2): vx_cmd, yr_cmd
+        2. [2:4] base_rpy (2): roll, pitch
+        3. [4:7] base_rpy_rate (3): roll_rate*0.5, pitch_rate*0.5, yaw_rate*0.5
+        4. [7:17] joint_pos_deviation (10): joint_pos[i] - ref_joint_act[i]
+        5. [17:27] joint_vel (10): joint_vel[i] * 0.1
+        6. [27:37] joint_pos_error (10): joint_act[i] - joint_pos[i]
+        7. [37:41] phase_info (4): sin/cos left phase, sin/cos right phase (with static_flag)
+        8. [41:43] frequency_info (2): (pm_f[0]*0.3-1)*static_flag, (pm_f[1]*0.3-1)*static_flag
 
         Args:
             env_ids: Optional tensor of environment indices. If None, uses all environments.
@@ -569,30 +579,35 @@ class QminiTaskEnv(DirectRLEnv):
         root_state = self.robot.data.root_state_w
         if use_slice:
             base_quat = root_state[:, 3:7]  # [w, x, y, z]
-            base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz]
+            base_ang_vel = root_state[:, 10:13]  # [ωx, ωy, ωz] = [roll_rate, pitch_rate, yaw_rate]
         else:
             base_quat = root_state[env_ids, 3:7]  # [w, x, y, z]
-            base_ang_vel = root_state[env_ids, 10:13]  # [ωx, ωy, ωz]
+            base_ang_vel = root_state[env_ids, 10:13]  # [ωx, ωy, ωz] = [roll_rate, pitch_rate, yaw_rate]
 
         # Convert quaternion to Euler angles (roll, pitch, yaw)
         roll, pitch, yaw = self._quat_to_euler(base_quat)
 
         # 1. [0:2] target_command (2 dims): vx_cmd, yr_cmd
+        # vx_cmd: 期望前进速度 (m/s), yr_cmd: 期望转向角速度 (rad/s)
         target_command = torch.zeros((num_envs, 2), device=self.device)
         if use_slice:
             cmd_slice = self._command
         else:
             cmd_slice = self._command[env_ids]
-        target_command[:, 0] = cmd_slice[:, 0]  # vx
-        target_command[:, 1] = cmd_slice[:, 2]  # yr (yaw rate)
+        target_command[:, 0] = cmd_slice[:, 0]  # vx_cmd: forward/backward velocity
+        target_command[:, 1] = cmd_slice[:, 2]  # yr_cmd: yaw rate (turning)
 
         # 2. [2:4] base_rpy (2 dims): roll, pitch
+        # roll: 基座横滚角 (rad), pitch: 基座俯仰角 (rad)
         base_rpy = torch.stack([roll, pitch], dim=1)
 
         # 3. [4:7] base_rpy_rate (3 dims): roll_rate*0.5, pitch_rate*0.5, yaw_rate*0.5
+        # base_ang_vel = [roll_rate, pitch_rate, yaw_rate] in rad/s
+        # Apply scaling factor 0.5 as per specification
         base_rpy_rate = base_ang_vel * 0.5
 
         # 4. [7:17] joint_pos_deviation (10 dims): joint_pos[i] - ref_joint_act[i]
+        # 关节位置相对参考位置的偏差 (rad)
         if use_slice:
             joint_pos_all = self.joint_pos  # [N, num_joints]
         else:
@@ -601,6 +616,7 @@ class QminiTaskEnv(DirectRLEnv):
         joint_pos_deviation = joint_pos_slice - self._ref_joint_act.unsqueeze(0)
 
         # 5. [17:27] joint_vel (10 dims): joint_vel[i] * 0.1
+        # 关节角速度（缩放）(rad/s), 缩放因子0.1
         if use_slice:
             joint_vel_all = self.joint_vel  # [N, num_joints]
         else:
@@ -609,6 +625,7 @@ class QminiTaskEnv(DirectRLEnv):
         joint_vel = joint_vel_slice * 0.1
 
         # 6. [27:37] joint_pos_error (10 dims): joint_act[i] - joint_pos[i]
+        # 目标位置与实际位置的误差 (rad)
         if use_slice:
             joint_act_slice = self._joint_act
         else:
@@ -616,45 +633,50 @@ class QminiTaskEnv(DirectRLEnv):
         joint_pos_error = joint_act_slice - joint_pos_slice
 
         # 7. [37:41] phase_info (4 dims): sin/cos left phase, sin/cos right phase
+        # Compute static_flag: 1 if moving (cmd_speed >= 0.15), 0 if stationary
         cmd_speed = torch.norm(target_command, dim=1)
         static_flag = (cmd_speed >= 0.15).float().unsqueeze(1)  # [N, 1]
 
         if use_slice:
-            phase_left_slice = self._pm_phase[:, 0:1]
-            phase_right_slice = self._pm_phase[:, 1:2]
+            phase_left_slice = self._pm_phase[:, 0:1]  # Left leg phase [N, 1]
+            phase_right_slice = self._pm_phase[:, 1:2]  # Right leg phase [N, 1]
         else:
             phase_left_slice = self._pm_phase[env_ids, 0:1]
             phase_right_slice = self._pm_phase[env_ids, 1:2]
+
+        # Phase encoding: sin/cos for left and right legs (with static_flag)
         phase_info = torch.cat([
-            torch.sin(phase_left_slice) * static_flag,
-            torch.cos(phase_left_slice) * static_flag,
-            torch.sin(phase_right_slice) * static_flag,
-            torch.cos(phase_right_slice) * static_flag,
+            torch.sin(phase_left_slice) * static_flag,   # [37] sin(_pm_phase[0]) * static_flag
+            torch.cos(phase_left_slice) * static_flag,   # [38] cos(_pm_phase[0]) * static_flag
+            torch.sin(phase_right_slice) * static_flag,   # [39] sin(_pm_phase[1]) * static_flag
+            torch.cos(phase_right_slice) * static_flag,   # [40] cos(_pm_phase[1]) * static_flag
         ], dim=1)  # [N, 4]
 
-        # 8. [41:43] frequency_info (2 dims): left freq, right freq
+        # 8. [41:43] frequency_info (2 dims): (pm_f[0]*0.3-1)*static_flag, (pm_f[1]*0.3-1)*static_flag
+        # 左腿步态频率, 右腿步态频率 (归一化)
         if use_slice:
-            pm_f_slice = self._pm_f
+            pm_f_slice = self._pm_f  # [N, 2] = [left_freq, right_freq] in Hz
         else:
             pm_f_slice = self._pm_f[env_ids]
+        # Formula: (pm_f * 0.3 - 1) * static_flag
         freq_info = (pm_f_slice * 0.3 - 1.0) * static_flag  # [N, 2]
 
         # Concatenate all observations: 2+2+3+10+10+10+4+2 = 43 dims
         obs = torch.cat(
             (
-                target_command,       # 2: [0:2]
-                base_rpy,             # 2: [2:4]
-                base_rpy_rate,        # 3: [4:7]
-                joint_pos_deviation,  # 10: [7:17]
-                joint_vel,            # 10: [17:27]
-                joint_pos_error,      # 10: [27:37]
-                phase_info,           # 4: [37:41]
-                freq_info,            # 2: [41:43]
+                target_command,       # 2: [0:2]   target_command
+                base_rpy,             # 2: [2:4]   base_rpy
+                base_rpy_rate,        # 3: [4:7]   base_rpy_rate
+                joint_pos_deviation,  # 10: [7:17]  joint_pos_deviation
+                joint_vel,            # 10: [17:27] joint_vel
+                joint_pos_error,      # 10: [27:37] joint_pos_error
+                phase_info,           # 4: [37:41] phase_info
+                freq_info,            # 2: [41:43] frequency_info
             ),
             dim=1,
         )
 
-        # Clip observations to [-3, 3] range
+        # Clip observations to [-3, 3] range (as per ONNX model specification)
         obs = torch.clamp(obs, -3.0, 3.0)
 
         return obs

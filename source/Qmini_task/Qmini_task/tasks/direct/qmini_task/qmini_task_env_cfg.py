@@ -222,13 +222,13 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
 
     # reward scales - Adjusted to prevent jumping and ensure reasonable reward values
     # 1. Task Rewards - Scaled down by 1000x to target ~10 reward at convergence
-    rew_scale_track_lin_vel_xy = 0.0015      # Scaled down from 1.5
+    rew_scale_track_lin_vel_xy = 0.0005      # Reduced from 0.0015 to lower velocity reward
     rew_scale_lin_vel_z = -0.001            # Scaled down from -1.0
-    rew_scale_track_ang_vel_z = 0.003       # Scaled down from 3.0
+    rew_scale_track_ang_vel_z = 0.001       # Reduced from 0.003 to lower velocity reward
     rew_scale_vel_tracking_error = -0.002   # Scaled down from -2.0
     rew_scale_ang_vel_tracking_error = -0.001  # Scaled down from -1.0
     rew_scale_alive = 0.0005                 # Scaled down from 0.5
-    rew_scale_reset_penalty = -0.001        # Scaled down from -1.0
+    rew_scale_reset_penalty = -10.0          # High penalty for falling/reset (increased from -0.001)
     rew_scale_stationary_penalty = -0.005   # Scaled down from -5.0
     stationary_velocity_threshold = 0.05  # Velocity threshold below which robot is considered stationary [m/s]
 
@@ -246,12 +246,12 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     rew_scale_joint_torques = -1.0e-8     # Scaled down from -1.0e-5
     rew_scale_dof_pos_limits = -0.002       # Scaled down from -2.0
 
-    # 4. Gait Rewards - Scaled down by 1000x
-    rew_scale_feet_air_time = 0.0003         # Scaled down from 0.3
-    rew_scale_feet_air_time_mean = 0.005     # Scaled down from 5.0
-    rew_scale_target_air_time = 0.002        # Scaled down from 2.0
-    rew_scale_feet_slide = -0.0002            # Scaled down from -0.2
-    rew_scale_leg_lift = 0.0003              # Scaled down from 0.3
+    # 4. Gait Rewards - Increased to encourage leg lifting
+    rew_scale_feet_air_time = 0.003          # Increased to encourage air time
+    rew_scale_feet_air_time_mean = 0.05      # Increased significantly to encourage leg lifting
+    rew_scale_target_air_time = 0.02         # Increased to encourage target air time (0.3s)
+    rew_scale_feet_slide = -0.0002           # Scaled down from -0.2
+    rew_scale_leg_lift = 0.003               # Increased to encourage leg lifting velocity
     rew_scale_feet_contact_forces = -0.00001  # Scaled down from -0.01
     rew_scale_feet_height_consistency = -0.005  # Scaled down from -5.0
 
@@ -295,7 +295,7 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     single_support_height_diff = 0.03  # 单腿支撑判断：高度差阈值 [m]
 
     joint_target_speed = 1.0        # 目标关节速度 [rad/s]
-    rew_scale_imbalance_penalty = -0.002   # Scaled down from -2.0 (target ~10 reward at convergence)
+    rew_scale_imbalance_penalty = -10.0   # High penalty for imbalance/falling (increased from -0.002)
     # 每关节最高角/线速度（来自 URDF velocity 字段；第二关节更低）
     joint_velocity_limits = (
         1.0,   # LL_joint1
@@ -311,9 +311,9 @@ class QminiTaskEnvCfg(DirectRLEnvCfg):
     )
 
     # command profile - Following reference configuration
-    command_lin_vel_x_range = (-0.5, 0.5)  # Reference: ranges.lin_vel_x=(-0.5, 0.5) - allow forward/backward
+    command_lin_vel_x_range = (-0.2, 0.3)  # Forward/backward velocity range: -0.2 to 0.3 m/s
     command_lin_vel_y_range = (-0.2, 0.2)  # Reference: ranges.lin_vel_y=(-0.2, 0.2) - allow lateral movement
-    command_yaw_range = (-0.5, 0.5)  # Increased from (-0.1, 0.1) to allow faster rotation/turning
+    command_yaw_range = (-0.5, 0.5)  # Rotation command range: -0.5 to 0.5 rad/s
     command_change_interval_s = 10.0  # Reference: resampling_time_range=(10.0, 10.0)
 
     # gait parameters - Following reference configuration

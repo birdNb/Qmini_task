@@ -761,13 +761,16 @@ def compute_total_reward(env) -> torch.Tensor:
     # Feet slide penalty (reference: weight=-0.3)
     rew_feet_slide = getattr(env.cfg, "rew_scale_feet_slide", -0.3) * compute_feet_slide(env)
 
-    # Feet clearance reward - Reduced weight to prevent excessive leg lifting
+    # Feet clearance reward - Encourages leg lifting during swing phase
     clearance_std = getattr(env.cfg, "feet_clearance_std", 0.05)
     clearance_tanh_mult = getattr(env.cfg, "feet_clearance_tanh_mult", 2.0)
     clearance_target = getattr(env.cfg, "desired_foot_clearance", 0.05)
     rew_feet_clearance = getattr(env.cfg, "rew_scale_leg_lift", 0.3) * compute_foot_clearance_reward(
         env, std=clearance_std, tanh_mult=clearance_tanh_mult, target_height=clearance_target
     )
+    
+    # Leg lift velocity reward - Encourages fast upward movement during swing
+    rew_leg_lift_velocity = getattr(env.cfg, "rew_scale_leg_lift", 0.3) * compute_leg_lift_velocity(env)
     
     # High reward for average feet air time (encourages lifting legs)
     rew_feet_air_time_mean = getattr(env.cfg, "rew_scale_feet_air_time_mean", 5.0) * compute_feet_air_time_mean_reward(env)
@@ -908,6 +911,7 @@ def compute_total_reward(env) -> torch.Tensor:
         + rew_gait  # Reference: gait reward
         + rew_feet_slide
         + rew_feet_clearance  # Reference: feet clearance reward
+        + rew_leg_lift_velocity  # Reward for upward leg velocity during swing
         + rew_feet_air_time_mean  # High reward for average feet air time
         + rew_target_air_time  # Reward for target air time (0.3s)
         + rew_feet_height_consistency  # Penalty for inconsistent foot heights when both feet are in contact
